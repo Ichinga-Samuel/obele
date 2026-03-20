@@ -1,0 +1,50 @@
+[project]
+name = "obele"
+version = "0.1.0b"
+description = "A lightweight, async-ready ORM for SQLite"
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.13"
+dependencies = []
+authors = [
+    {name = "Ichinga Samuel"},
+]
+keywords = ["orm", "sqlite", "async", "database", "sql"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Database",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Typing :: Typed",
+    "Framework :: AsyncIO",
+]
+
+[project.urls]
+Homepage = "https://github.com/ichinga-samuel/obele"
+Repository = "https://github.com/ichinga-samuel/obele"
+Issues = "https://github.com/ichinga-samuel/obele/issues"
+Changelog = "https://github.com/ichinga-samuel/obele/blob/main/CHANGELOG.md"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=9.0.2",
+    "pytest-asyncio>=1.0",
+]
+
+[project.scripts]
+obele-orm = "obele.orm.cli:main"
+
+[build-system]
+requires = ["setuptools>=75.0"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["obele*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
