@@ -27,36 +27,16 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 _LOOKUPS: dict[str, str] = {
-    # Basic comparisons
-    "exact": "= ?",
-    "ne": "!= ?",
-    "gt": "> ?",
-    "gte": ">= ?",
-    "lt": "< ?",
-    "lte": "<= ?",
-    # Pattern matching
-    "like": "LIKE ?",
-    "glob": "GLOB ?",
-    # Special handling (value expansion required)
-    "in": "IN",
-    "not_in": "NOT_IN",
-    "is_null": "IS",
-    "between": "BETWEEN",
-    "range": "BETWEEN",
-    # String lookups (case-sensitive)
-    "contains": "CONTAINS",
-    "startswith": "STARTSWITH",
-    "endswith": "ENDSWITH",
-    # String lookups (case-insensitive)
-    "iexact": "IEXACT",
-    "icontains": "ICONTAINS",
-    "istartswith": "ISTARTSWITH",
-    "iendswith": "IENDSWITH",
-    # Regex
+    "exact": "= ?", "ne": "!= ?", "gt": "> ?", "gte": ">= ?",
+    "lt": "< ?", "lte": "<= ?", "like": "LIKE ?", "glob": "GLOB ?",
+    "in": "IN", "not_in": "NOT_IN", "is_null": "IS",
+    "between": "BETWEEN", "range": "BETWEEN",
+    "contains": "CONTAINS", "startswith": "STARTSWITH", "endswith": "ENDSWITH",
+    "iexact": "IEXACT", "icontains": "ICONTAINS",
+    "istartswith": "ISTARTSWITH", "iendswith": "IENDSWITH",
     "regex": "REGEXP ?",
 }
 
-# Characters that need escaping in LIKE patterns
 _LIKE_ESCAPE_CHAR = "\\"
 
 
@@ -94,6 +74,8 @@ class Q:
         ~Q(age__lt=18)
     """
 
+    __slots__ = ("children", "connector", "negated")
+
     def __init__(self, *children: Q, **lookups: Any) -> None:
         self.children: list[Q | tuple[str, Any]] = [*children, *lookups.items()]
         self.connector: str = "AND"
@@ -130,16 +112,19 @@ class Expression:
 
 class Value(Expression):
     """Wrap a literal Python value as an SQL parameter."""
+    __slots__ = ("value",)
+
     def __init__(self, value: Any) -> None:
         self.value = value
 
     def as_sql(self, queryset: QuerySet) -> tuple[str, list[Any]]:
-        del queryset
         return "?", [self.value]
 
 
 class F(Expression):
     """Reference a model field (or joined field) by dotted path."""
+    __slots__ = ("field_path",)
+
     def __init__(self, field_path: str) -> None:
         self.field_path = field_path
 
@@ -150,17 +135,20 @@ class F(Expression):
 
 class RawSQL(Expression):
     """Inject raw SQL with optional parameter bindings."""
+    __slots__ = ("sql", "params")
+
     def __init__(self, sql: str, params: list[Any] | tuple[Any, ...] | None = None) -> None:
         self.sql = sql
         self.params = list(params or [])
 
     def as_sql(self, queryset: QuerySet) -> tuple[str, list[Any]]:
-        del queryset
         return self.sql, list(self.params)
 
 
 class Func(Expression):
     """Call an SQL function with arguments."""
+    __slots__ = ("name", "args", "is_aggregate")
+
     def __init__(self, name: str, *args: Any, is_aggregate: bool = False) -> None:
         self.name = name
         self.args = args
@@ -204,12 +192,13 @@ class Max(Func):
 
 class Subquery(Expression):
     """Embed another QuerySet as a subquery."""
+    __slots__ = ("queryset", "field")
+
     def __init__(self, queryset: QuerySet, field: str | None = None) -> None:
         self.queryset = queryset
         self.field = field
 
     def as_sql(self, queryset: QuerySet) -> tuple[str, list[Any]]:
-        del queryset
         field_name = self.field or self.queryset.model_cls._pk_name
         column_sql, _ = self.queryset._resolve_field_reference(field_name.split("__"))
         return self.queryset._build_select(select_override=[column_sql], include_annotations=False)
@@ -219,7 +208,7 @@ class Subquery(Expression):
 # JoinSpec
 # ===========================================================================
 
-@dataclass
+@dataclass(slots=True)
 class _JoinSpec:
     path: tuple[str, ...]
     alias: str
@@ -228,6 +217,21 @@ class _JoinSpec:
     relation_kind: str
     relation_field_name: str
     sql: str
+
+
+# ===========================================================================
+# LIKE pattern dispatch
+# ===========================================================================
+
+_LIKE_PATTERNS: dict[str, tuple[str, str]] = {
+    "contains":    ("%{v}%", "LIKE"),
+    "startswith":  ("{v}%",  "LIKE"),
+    "endswith":    ("%{v}",  "LIKE"),
+    "icontains":   ("%{v}%", "LIKE"),
+    "istartswith": ("{v}%",  "LIKE"),
+    "iendswith":   ("%{v}",  "LIKE"),
+    "iexact":      ("{v}",   "LIKE"),
+}
 
 
 # ===========================================================================
@@ -252,6 +256,13 @@ class QuerySet:
         self._select_fields: list[str] = [f"{model_cls.table_name}.*"]
         self._selected_related: dict[str, _JoinSpec] = {}
         self._annotations: dict[str, Expression] = {}
+        self._distinct: bool = False
+        self._group_by_fields: list[str] = []
+        self._having_fragments: list[tuple[str, list[Any]]] = []
+        self._values_fields: list[str] | None = None
+        self._values_flat: bool = False
+        self._only_fields: list[str] | None = None
+        self._defer_fields: list[str] | None = None
 
     def __iter__(self) -> Iterator[Model]:
         return self.iterator()
@@ -268,7 +279,26 @@ class QuerySet:
         return f"<QuerySet sql={sql!r} params={params!r}>"
 
     def _clone(self) -> QuerySet:
-        return copy.deepcopy(self)
+        """Shallow-copy the QuerySet for efficient chaining."""
+        qs = QuerySet.__new__(QuerySet)
+        qs.model_cls = self.model_cls
+        qs._where_fragments = list(self._where_fragments)
+        qs._order_fields = list(self._order_fields)
+        qs._limit_val = self._limit_val
+        qs._offset_val = self._offset_val
+        qs._join_specs = list(self._join_specs)
+        qs._join_map = dict(self._join_map)
+        qs._select_fields = list(self._select_fields)
+        qs._selected_related = dict(self._selected_related)
+        qs._annotations = dict(self._annotations)
+        qs._distinct = self._distinct
+        qs._group_by_fields = list(self._group_by_fields)
+        qs._having_fragments = list(self._having_fragments)
+        qs._values_fields = list(self._values_fields) if self._values_fields is not None else None
+        qs._values_flat = self._values_flat
+        qs._only_fields = list(self._only_fields) if self._only_fields is not None else None
+        qs._defer_fields = list(self._defer_fields) if self._defer_fields is not None else None
+        return qs
 
     # ------------------------------------------------------------------
     # Filtering
@@ -312,7 +342,7 @@ class QuerySet:
         qs = self._clone()
         for field_name in fields:
             direction = "DESC" if field_name.startswith("-") else "ASC"
-            raw_name = field_name[1:] if field_name.startswith("-") else field_name
+            raw_name = field_name.lstrip("-")
             if raw_name in qs._annotations:
                 qs._order_fields.append(f"{raw_name} {direction}")
                 continue
@@ -328,6 +358,44 @@ class QuerySet:
     def offset(self, n: int) -> QuerySet:
         qs = self._clone()
         qs._offset_val = n
+        return qs
+
+    # ------------------------------------------------------------------
+    # Projection
+    # ------------------------------------------------------------------
+
+    def distinct(self) -> QuerySet:
+        """Add ``SELECT DISTINCT``."""
+        qs = self._clone()
+        qs._distinct = True
+        return qs
+
+    def values(self, *fields: str) -> QuerySet:
+        """Return dicts of specified fields instead of model instances."""
+        qs = self._clone()
+        qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
+        qs._values_flat = False
+        return qs
+
+    def values_list(self, *fields: str, flat: bool = False) -> QuerySet:
+        """Return tuples (or flat list if ``flat=True``) of specified fields."""
+        if flat and len(fields) != 1:
+            raise ValueError("flat=True requires exactly one field")
+        qs = self._clone()
+        qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
+        qs._values_flat = flat
+        return qs
+
+    def only(self, *fields: str) -> QuerySet:
+        """Load only the specified fields (plus the PK)."""
+        qs = self._clone()
+        qs._only_fields = list(fields)
+        return qs
+
+    def defer(self, *fields: str) -> QuerySet:
+        """Defer loading of specified fields."""
+        qs = self._clone()
+        qs._defer_fields = list(fields)
         return qs
 
     # ------------------------------------------------------------------
@@ -360,7 +428,7 @@ class QuerySet:
         return qs
 
     # ------------------------------------------------------------------
-    # Annotations
+    # Annotations / Group By / Having
     # ------------------------------------------------------------------
 
     def annotate(self, **annotations: Any) -> QuerySet:
@@ -373,9 +441,106 @@ class QuerySet:
             qs._annotations[alias] = qs._coerce_expression(expression)
         return qs
 
+    def group_by(self, *fields: str) -> QuerySet:
+        """Add explicit GROUP BY columns."""
+        qs = self._clone()
+        for field_name in fields:
+            col, _ = qs._resolve_field_reference(field_name.split("__"))
+            qs._group_by_fields.append(col)
+        return qs
+
+    def having(self, *conditions: Q, **kwargs: Any) -> QuerySet:
+        """Add HAVING conditions for filtered aggregates."""
+        qs = self._clone()
+        if kwargs:
+            conditions = (*conditions, Q(**kwargs))
+        for condition in conditions:
+            if not isinstance(condition, Q):
+                raise TypeError("having() positional arguments must be Q objects")
+            sql, params = qs._compile_q(condition)
+            qs._having_fragments.append((sql, params))
+        return qs
+
+    # ------------------------------------------------------------------
+    # Set operations
+    # ------------------------------------------------------------------
+
+    def union(self, other: QuerySet, *, all: bool = False) -> QuerySet:
+        """Combine with another QuerySet using UNION."""
+        return self._set_operation("UNION ALL" if all else "UNION", other)
+
+    def intersection(self, other: QuerySet) -> QuerySet:
+        """Combine with another QuerySet using INTERSECT."""
+        return self._set_operation("INTERSECT", other)
+
+    def difference(self, other: QuerySet) -> QuerySet:
+        """Combine with another QuerySet using EXCEPT."""
+        return self._set_operation("EXCEPT", other)
+
+    def _set_operation(self, op: str, other: QuerySet) -> QuerySet:
+        """Build a set-operation QuerySet wrapping two sub-selects."""
+        left_sql, left_params = self._build_select()
+        right_sql, right_params = other._build_select()
+        combined_sql = f"{left_sql} {op} {right_sql}"
+        combined_params = left_params + right_params
+        # Return a new QuerySet that wraps the combined SQL
+        qs = QuerySet.__new__(QuerySet)
+        qs.model_cls = self.model_cls
+        qs._where_fragments = []
+        qs._order_fields = []
+        qs._limit_val = None
+        qs._offset_val = None
+        qs._join_specs = []
+        qs._join_map = {}
+        qs._select_fields = [f"{self.model_cls.table_name}.*"]
+        qs._selected_related = {}
+        qs._annotations = {}
+        qs._distinct = False
+        qs._group_by_fields = []
+        qs._having_fragments = []
+        qs._values_fields = self._values_fields
+        qs._values_flat = self._values_flat
+        qs._only_fields = None
+        qs._defer_fields = None
+        qs._raw_sql = combined_sql
+        qs._raw_params = combined_params
+        return qs
+
     # ------------------------------------------------------------------
     # SQL building
     # ------------------------------------------------------------------
+
+    def _get_select_columns(self) -> list[str]:
+        """Determine the SELECT column list based on only/defer/values."""
+        if self._only_fields is not None:
+            pk_name = self.model_cls._pk_name
+            field_names = set(self._only_fields) | {pk_name}
+            table = self.model_cls.table_name
+            return [
+                f"{table}.{self.model_cls._fields[n].column_name}"
+                for n in field_names
+                if n in self.model_cls._fields
+            ]
+        if self._defer_fields is not None:
+            deferred = set(self._defer_fields)
+            table = self.model_cls.table_name
+            return [
+                f"{table}.{f.column_name}"
+                for n, f in self.model_cls._fields.items()
+                if n not in deferred
+            ]
+        if self._values_fields is not None:
+            table = self.model_cls.table_name
+            cols = []
+            for name in self._values_fields:
+                if name in self.model_cls._fields:
+                    cols.append(f"{table}.{self.model_cls._fields[name].column_name}")
+                elif name in self._annotations:
+                    pass  # Will be added by annotation handling
+                else:
+                    cols.append(name)
+            return cols
+        return list(self._select_fields)
 
     def _build_select(
         self,
@@ -383,8 +548,12 @@ class QuerySet:
         select_override: list[str] | None = None,
         include_annotations: bool = True,
     ) -> tuple[str, list[Any]]:
+        # Handle set-operation wrapped querysets
+        if hasattr(self, "_raw_sql"):
+            return self._raw_sql, self._raw_params
+
         params: list[Any] = []
-        select_parts = list(select_override or self._select_fields)
+        select_parts = list(select_override or self._get_select_columns())
 
         if include_annotations and self._annotations:
             for alias, expression in self._annotations.items():
@@ -392,9 +561,9 @@ class QuerySet:
                 select_parts.append(f"{expr_sql} AS {alias}")
                 params.extend(expr_params)
 
+        distinct = "DISTINCT " if self._distinct else ""
         parts = [
-            "SELECT",
-            ", ".join(select_parts),
+            f"SELECT {distinct}{', '.join(select_parts)}",
             "FROM",
             self.model_cls.table_name,
         ]
@@ -404,15 +573,28 @@ class QuerySet:
         if self._where_fragments:
             parts.append("WHERE")
             parts.append(" AND ".join(fragment for fragment, _ in self._where_fragments))
-            params.extend(self._where_params())
+            for _, fragment_params in self._where_fragments:
+                params.extend(fragment_params)
 
-        if include_annotations and any(expr.is_aggregate for expr in self._annotations.values()):
+        # GROUP BY
+        group_by_cols = list(self._group_by_fields)
+        if not group_by_cols and include_annotations and any(
+            expr.is_aggregate for expr in self._annotations.values()
+        ):
             pk_col = self.model_cls._pk_field.column_name
-            parts.append(f"GROUP BY {self.model_cls.table_name}.{pk_col}")
+            group_by_cols.append(f"{self.model_cls.table_name}.{pk_col}")
+        if group_by_cols:
+            parts.append(f"GROUP BY {', '.join(group_by_cols)}")
+
+        # HAVING
+        if self._having_fragments:
+            parts.append("HAVING")
+            parts.append(" AND ".join(frag for frag, _ in self._having_fragments))
+            for _, frag_params in self._having_fragments:
+                params.extend(frag_params)
 
         if self._order_fields:
-            parts.append("ORDER BY")
-            parts.append(", ".join(self._order_fields))
+            parts.append(f"ORDER BY {', '.join(self._order_fields)}")
         if self._limit_val is not None:
             parts.append(f"LIMIT {self._limit_val}")
         elif self._offset_val is not None:
@@ -421,11 +603,18 @@ class QuerySet:
             parts.append(f"OFFSET {self._offset_val}")
         return " ".join(parts), params
 
-    def _where_params(self) -> list[Any]:
-        params: list[Any] = []
-        for _, fragment_params in self._where_fragments:
-            params.extend(fragment_params)
-        return params
+    def as_sql(self) -> tuple[str, list[Any]]:
+        """Return the ``(sql, params)`` tuple without executing."""
+        return self._build_select()
+
+    def explain(self) -> str:
+        """Return the ``EXPLAIN QUERY PLAN`` output for debugging."""
+        sql, params = self._build_select()
+        rows = Database.fetchall(f"EXPLAIN QUERY PLAN {sql}", params)
+        return "\n".join(
+            f"  {row['detail']}" if "detail" in row.keys() else str(dict(row))
+            for row in rows
+        )
 
     # ------------------------------------------------------------------
     # Row -> instance conversion (with hydration + annotations)
@@ -435,19 +624,16 @@ class QuerySet:
         """Build a model instance from a DB row, hydrating related objects."""
         row_dict = dict(row)
 
-        # Extract base data
         base_data = {
             field.column_name: row_dict[field.column_name]
             for field in self.model_cls._fields.values()
             if field.column_name in row_dict
         }
-        # Extract annotations
         annotations = {
             alias: row_dict[alias]
             for alias in self._annotations
             if alias in row_dict
         }
-
         instance = self.model_cls._from_row(base_data, annotations=annotations)
 
         # Hydrate related objects from select_related
@@ -465,18 +651,37 @@ class QuerySet:
 
         return instance
 
+    def _row_to_values(self, row: Any) -> dict[str, Any] | tuple | Any:
+        """Convert a row to a values dict/tuple/scalar based on _values_fields."""
+        row_dict = dict(row)
+        fields = self._values_fields
+        if self._values_flat:
+            name = fields[0]
+            if name in self.model_cls._fields:
+                return row_dict.get(self.model_cls._fields[name].column_name)
+            return row_dict.get(name)
+
+        result = {}
+        for name in fields:
+            if name in self.model_cls._fields:
+                col = self.model_cls._fields[name].column_name
+                result[name] = row_dict.get(col)
+            elif name in row_dict:
+                result[name] = row_dict[name]
+        return result if not self._values_flat else tuple(result.values())
+
     # ------------------------------------------------------------------
     # Materialisation
     # ------------------------------------------------------------------
 
-    def all(self) -> list[Model]:
-        """Execute the query and return a list of model instances."""
+    def all(self) -> list:
+        """Execute the query and return results."""
         return list(self.iterator())
 
-    def first(self) -> Model | None:
+    def first(self) -> Any:
         """Return the first result or ``None``."""
-        for instance in self.limit(1).iterator():
-            return instance
+        for item in self.limit(1).iterator():
+            return item
         return None
 
     def get(self, **kwargs: Any) -> Model:
@@ -497,33 +702,29 @@ class QuerySet:
     # Streaming iteration
     # ------------------------------------------------------------------
 
-    def iterator(self, chunk_size: int = 2000) -> Iterator[Model]:
-        """Stream results row-by-row without materializing the full list.
-
-        Uses ``cursor.fetchmany(chunk_size)`` to read in chunks.
-        """
+    def iterator(self, chunk_size: int = 2000) -> Iterator:
+        """Stream results row-by-row without materializing the full list."""
         sql, params = self._build_select()
         cursor = Database.execute_read(sql, params)
+        converter = self._row_to_values if self._values_fields is not None else self._row_to_instance
         while True:
             rows = cursor.fetchmany(chunk_size)
             if not rows:
                 break
             for row in rows:
-                yield self._row_to_instance(row)
+                yield converter(row)
 
-    async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator[Model]:
-        """Async streaming results.
-
-        Fetches chunks via ``asyncio.to_thread`` and yields instances.
-        """
+    async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator:
+        """Async streaming results."""
         sql, params = self._build_select()
         cursor = await asyncio.to_thread(Database.execute_read, sql, params)
+        converter = self._row_to_values if self._values_fields is not None else self._row_to_instance
         while True:
             rows = await asyncio.to_thread(cursor.fetchmany, chunk_size)
             if not rows:
                 break
             for row in rows:
-                yield self._row_to_instance(row)
+                yield converter(row)
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -536,8 +737,13 @@ class QuerySet:
         return int(Database.fetch_value(count_sql, params, column="cnt") or 0)
 
     def exists(self) -> bool:
-        """Return ``True`` if at least one row matches."""
-        return self.count() > 0
+        """Return ``True`` if at least one row matches.
+
+        Uses ``SELECT 1 ... LIMIT 1`` for efficiency.
+        """
+        sql, params = self._build_select()
+        row = Database.fetchone(f"SELECT 1 FROM ({sql}) LIMIT 1", params)
+        return row is not None
 
     def aggregate(self, func: str, field: str) -> Any:
         """Run an aggregate function (SUM, AVG, MIN, MAX, COUNT)."""
@@ -557,11 +763,7 @@ class QuerySet:
     # ------------------------------------------------------------------
 
     def update(self, *, validate: bool = True, **kwargs: Any) -> int:
-        """Bulk UPDATE matching rows.  Returns number of rows affected.
-
-        When *validate* is ``True`` (default), each value is validated
-        against its field constraints before the SQL is executed.
-        """
+        """Bulk UPDATE matching rows.  Returns number of rows affected."""
         set_parts: list[str] = []
         set_params: list[Any] = []
         for key, value in kwargs.items():
@@ -574,28 +776,33 @@ class QuerySet:
             set_params.append(db_val)
 
         sql = f"UPDATE {self.model_cls.table_name} SET {', '.join(set_parts)}"
+        where_params: list[Any] = []
         if self._where_fragments:
-            sql += " WHERE " + " AND ".join(fragment for fragment, _ in self._where_fragments)
-        all_params = set_params + self._where_params()
-        cursor = Database.execute(sql, all_params)
+            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
+            for _, fp in self._where_fragments:
+                where_params.extend(fp)
+        cursor = Database.execute(sql, set_params + where_params)
         return cursor.rowcount
 
     def delete(self) -> int:
         """Bulk DELETE matching rows.  Returns number of rows affected."""
         sql = f"DELETE FROM {self.model_cls.table_name}"
+        params: list[Any] = []
         if self._where_fragments:
-            sql += " WHERE " + " AND ".join(fragment for fragment, _ in self._where_fragments)
-        cursor = Database.execute(sql, self._where_params())
+            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
+            for _, fp in self._where_fragments:
+                params.extend(fp)
+        cursor = Database.execute(sql, params)
         return cursor.rowcount
 
     # ------------------------------------------------------------------
     # Async variants
     # ------------------------------------------------------------------
 
-    async def aall(self) -> list[Model]:
+    async def aall(self) -> list:
         return await asyncio.to_thread(self.all)
 
-    async def afirst(self) -> Model | None:
+    async def afirst(self) -> Any:
         return await asyncio.to_thread(self.first)
 
     async def aget(self, **kwargs: Any) -> Model:
@@ -651,82 +858,22 @@ class QuerySet:
         field_parts, lookup = self._split_lookup(key)
         column_sql, field_obj = self._resolve_field_reference(field_parts)
 
-        # Special-case lookups
-        if lookup == "in":
-            if isinstance(value, QuerySet):
-                value = Subquery(value)
-            if isinstance(value, Subquery):
-                sub_sql, sub_params = value.as_sql(self)
-                return f"{column_sql} IN ({sub_sql})", sub_params
-            if not isinstance(value, (list, tuple, set)):
-                value = [value]
-            values = list(value)
-            placeholders = ", ".join("?" for _ in values)
-            params = [field_obj.to_db(v) if field_obj else v for v in values]
-            return f"{column_sql} IN ({placeholders})", params
+        # Dispatch to specialized handlers
+        handler = _LOOKUP_DISPATCH.get(lookup)
+        if handler is not None:
+            return handler(self, column_sql, field_obj, value)
 
-        if lookup == "not_in":
-            if not isinstance(value, (list, tuple, set)):
-                value = [value]
-            values = list(value)
-            placeholders = ", ".join("?" for _ in values)
-            params = [field_obj.to_db(v) if field_obj else v for v in values]
-            return f"{column_sql} NOT IN ({placeholders})", params
+        # LIKE-pattern lookups (contains, startswith, endswith + i-variants)
+        if lookup in _LIKE_PATTERNS:
+            return self._compile_like(column_sql, lookup, value)
 
-        if lookup == "is_null":
-            return (
-                f"{column_sql} {'IS NULL' if value else 'IS NOT NULL'}",
-                [],
-            )
-
-        if lookup in ("between", "range"):
-            if not isinstance(value, (list, tuple)) or len(value) != 2:
-                raise ValueError(
-                    f"'{lookup}' lookup requires a 2-element tuple/list, "
-                    f"got {type(value).__name__}"
-                )
-            lo, hi = value
-            if field_obj:
-                lo = field_obj.to_db(lo)
-                hi = field_obj.to_db(hi)
-            return f"{column_sql} BETWEEN ? AND ?", [lo, hi]
-
-        if lookup == "contains":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"%{escaped}%"]
-
-        if lookup == "startswith":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"{escaped}%"]
-
-        if lookup == "endswith":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"%{escaped}"]
-
-        if lookup == "iexact":
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [str(value)]
-
-        if lookup == "icontains":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"%{escaped}%"]
-
-        if lookup == "istartswith":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"{escaped}%"]
-
-        if lookup == "iendswith":
-            escaped = _escape_like(str(value))
-            return f"{column_sql} LIKE ? ESCAPE '\\'", [f"%{escaped}"]
-
-        # Expression-based values (Subquery, F, etc.)
+        # Expression-based values
         if isinstance(value, QuerySet):
             value = Subquery(value)
-
         if isinstance(value, Subquery):
             sub_sql, sub_params = value.as_sql(self)
             operator = _LOOKUPS[lookup].replace("?", f"({sub_sql})")
             return f"{column_sql} {operator}", sub_params
-
         if isinstance(value, Expression):
             expr_sql, expr_params = value.as_sql(self)
             operator = _LOOKUPS[lookup].replace("?", expr_sql)
@@ -735,6 +882,14 @@ class QuerySet:
         # Standard single-value lookups
         db_val = field_obj.to_db(value) if field_obj else value
         return f"{column_sql} {_LOOKUPS[lookup]}", [db_val]
+
+    @staticmethod
+    def _compile_like(column_sql: str, lookup: str, value: Any) -> tuple[str, list[Any]]:
+        """Compile a LIKE-pattern lookup."""
+        pattern_template, _ = _LIKE_PATTERNS[lookup]
+        escaped = _escape_like(str(value))
+        pattern = pattern_template.replace("{v}", escaped)
+        return f"{column_sql} LIKE ? ESCAPE '\\'", [pattern]
 
     # ------------------------------------------------------------------
     # Internal: expression coercion
@@ -801,20 +956,14 @@ class QuerySet:
                 f"ON {parent_alias}.{field_obj.column_name} = {alias}.{related_pk}"
             )
             join_spec = _JoinSpec(
-                path=path,
-                alias=alias,
-                related_model=related_model,
-                relation_name=relation_name,
-                relation_kind="forward",
-                relation_field_name=relation_name,
-                sql=sql,
+                path=path, alias=alias, related_model=related_model,
+                relation_name=relation_name, relation_kind="forward",
+                relation_field_name=relation_name, sql=sql,
             )
         else:
             # Reverse relation join
             reverse_relations: dict[str, ReverseRelationDescriptor] = getattr(
-                parent_model,
-                "_reverse_relations",
-                {},
+                parent_model, "_reverse_relations", {},
             )
             descriptor = reverse_relations.get(relation_name)
             if descriptor is None:
@@ -829,15 +978,61 @@ class QuerySet:
                 f"ON {alias}.{fk_field.column_name} = {parent_alias}.{parent_pk}"
             )
             join_spec = _JoinSpec(
-                path=path,
-                alias=alias,
-                related_model=related_model,
-                relation_name=relation_name,
-                relation_kind="reverse",
-                relation_field_name=descriptor.field_name,
-                sql=sql,
+                path=path, alias=alias, related_model=related_model,
+                relation_name=relation_name, relation_kind="reverse",
+                relation_field_name=descriptor.field_name, sql=sql,
             )
 
         self._join_map[path] = join_spec
         self._join_specs.append(join_spec)
         return join_spec
+
+
+# ===========================================================================
+# Lookup dispatch table
+# ===========================================================================
+
+def _compile_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
+    if isinstance(value, QuerySet):
+        value = Subquery(value)
+    if isinstance(value, Subquery):
+        sub_sql, sub_params = value.as_sql(qs)
+        return f"{col} IN ({sub_sql})", sub_params
+    if not isinstance(value, (list, tuple, set)):
+        value = [value]
+    values = list(value)
+    placeholders = ", ".join("?" for _ in values)
+    params = [field_obj.to_db(v) if field_obj else v for v in values]
+    return f"{col} IN ({placeholders})", params
+
+
+def _compile_not_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
+    if not isinstance(value, (list, tuple, set)):
+        value = [value]
+    values = list(value)
+    placeholders = ", ".join("?" for _ in values)
+    params = [field_obj.to_db(v) if field_obj else v for v in values]
+    return f"{col} NOT IN ({placeholders})", params
+
+
+def _compile_is_null(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
+    return (f"{col} {'IS NULL' if value else 'IS NOT NULL'}", [])
+
+
+def _compile_between(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
+    if not isinstance(value, (list, tuple)) or len(value) != 2:
+        raise ValueError("'between' lookup requires a 2-element tuple/list")
+    lo, hi = value
+    if field_obj:
+        lo = field_obj.to_db(lo)
+        hi = field_obj.to_db(hi)
+    return f"{col} BETWEEN ? AND ?", [lo, hi]
+
+
+_LOOKUP_DISPATCH: dict[str, Any] = {
+    "in": _compile_in,
+    "not_in": _compile_not_in,
+    "is_null": _compile_is_null,
+    "between": _compile_between,
+    "range": _compile_between,
+}

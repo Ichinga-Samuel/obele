@@ -26,6 +26,9 @@ from .orm import (
     BlobField,
     BooleanField,
     DateTimeField,
+    DateField,
+    TimestampField,
+    JSONField,
     ForeignKeyField,
     Model,
     ReverseRelationManager,
@@ -48,6 +51,8 @@ from .orm import (
     MultipleResultsError,
     DatabaseError,
     IntegrityError,
+    MigrationError,
+    ConfigurationError,
 )
 from .kv import KVStore, KV
 
@@ -77,6 +82,9 @@ __all__ = [
     "BlobField",
     "BooleanField",
     "DateTimeField",
+    "DateField",
+    "TimestampField",
+    "JSONField",
     "ForeignKeyField",
     "ORMError",
     "FieldValidationError",
@@ -84,7 +92,8 @@ __all__ = [
     "MultipleResultsError",
     "DatabaseError",
     "IntegrityError",
+    "MigrationError",
+    "ConfigurationError",
     "KVStore",
     "KV",
 ]
-

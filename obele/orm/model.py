@@ -19,7 +19,7 @@ from typing import Any, ClassVar
 from .database import Database
 from .fields import Field, IntegerField, ForeignKeyField, _MISSING
 from .query import QuerySet
-from .exceptions import RecordNotFoundError, FieldValidationError
+from .exceptions import RecordNotFoundError, FieldValidationError, MigrationError
 
 # Global registry so ForeignKeyField can resolve string references lazily.
 _model_registry: dict[str, type[Model]] = {}
@@ -40,77 +40,33 @@ class ReverseRelationManager:
         user.posts.create(title="New Post")
     """
 
-    def __init__(
-        self,
-        instance: Model,
-        related_model: type[Model],
-        field_name: str,
-    ) -> None:
+    __slots__ = ("instance", "related_model", "field_name")
+
+    def __init__(self, instance: Model, related_model: type[Model], field_name: str) -> None:
         self.instance = instance
         self.related_model = related_model
         self.field_name = field_name
 
     def __repr__(self) -> str:
-        pk_value = self.instance.__dict__.get(self.instance._pk_name)
+        pk = self.instance.__dict__.get(self.instance._pk_name)
         return (
             f"<ReverseRelationManager owner={type(self.instance).__name__} "
-            f"related={self.related_model.__name__} field={self.field_name!r} pk={pk_value}>"
+            f"related={self.related_model.__name__} field={self.field_name!r} pk={pk}>"
         )
 
     def _queryset(self) -> QuerySet:
-        pk_value = self.instance.__dict__.get(self.instance._pk_name)
-        if pk_value is None:
+        pk = self.instance.__dict__.get(self.instance._pk_name)
+        if pk is None:
             raise RecordNotFoundError("Cannot use a reverse relation on an unsaved instance")
-        return self.related_model.filter(**{self.field_name: pk_value})
+        return self.related_model.filter(**{self.field_name: pk})
 
-    def queryset(self) -> QuerySet:
-        """Return the underlying ``QuerySet`` for further chaining."""
-        return self._queryset()
-
-    def all(self) -> list[Model]:
-        return self._queryset().all()
-
-    async def aall(self) -> list[Model]:
-        return await self._queryset().aall()
-
-    def filter(self, *conditions: Any, **kwargs: Any) -> QuerySet:
-        return self._queryset().filter(*conditions, **kwargs)
-
-    def exclude(self, *conditions: Any, **kwargs: Any) -> QuerySet:
-        return self._queryset().exclude(*conditions, **kwargs)
-
-    def order_by(self, *fields: str) -> QuerySet:
-        return self._queryset().order_by(*fields)
-
-    def limit(self, n: int) -> QuerySet:
-        return self._queryset().limit(n)
-
-    def offset(self, n: int) -> QuerySet:
-        return self._queryset().offset(n)
-
-    def count(self) -> int:
-        return self._queryset().count()
-
-    async def acount(self) -> int:
-        return await self._queryset().acount()
-
-    def exists(self) -> bool:
-        return self._queryset().exists()
-
-    async def aexists(self) -> bool:
-        return await self._queryset().aexists()
-
-    def first(self) -> Model | None:
-        return self._queryset().first()
-
-    async def afirst(self) -> Model | None:
-        return await self._queryset().afirst()
-
-    def get(self, **kwargs: Any) -> Model:
-        return self._queryset().get(**kwargs)
-
-    async def aget(self, **kwargs: Any) -> Model:
-        return await self._queryset().aget(**kwargs)
+    # Delegate all QuerySet methods dynamically
+    def __getattr__(self, name: str) -> Any:
+        qs = self._queryset()
+        attr = getattr(qs, name, None)
+        if attr is not None:
+            return attr
+        raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
     def create(self, **kwargs: Any) -> Model:
         """Create a related object with the FK pre-set to this instance."""
@@ -137,12 +93,9 @@ class ReverseRelationDescriptor:
     bound to the calling instance.
     """
 
-    def __init__(
-        self,
-        related_model: type[Model],
-        field_name: str,
-        accessor_name: str,
-    ) -> None:
+    __slots__ = ("related_model", "field_name", "accessor_name")
+
+    def __init__(self, related_model: type[Model], field_name: str, accessor_name: str) -> None:
         self.related_model = related_model
         self.field_name = field_name
         self.accessor_name = accessor_name
@@ -189,12 +142,7 @@ def _register_reverse_relations() -> None:
 class MetaModel(type):
     """Collect ``Field`` descriptors and configure the Model class."""
 
-    def __new__(
-        mcs,
-        cls_name: str,
-        bases: tuple[type, ...],
-        namespace: dict[str, Any],
-    ) -> type:
+    def __new__(mcs, cls_name: str, bases: tuple[type, ...], namespace: dict[str, Any]) -> type:
         fields: dict[str, Field] = {}
 
         # Inherit fields from parent models
@@ -234,12 +182,39 @@ class MetaModel(type):
         cls._pk_field = pk_field
         cls._pk_name = pk_field.attr_name if pk_field else "id"
 
+        # Pre-compute SQL templates for INSERT/UPDATE
+        if any(hasattr(b, "_fields") for b in bases):
+            mcs._cache_sql_templates(cls)
+
         # Register for FK lazy resolution + reverse relations
         if cls_name != "Model":
             _model_registry[cls_name] = cls
             _register_reverse_relations()
 
         return cls
+
+    @staticmethod
+    def _cache_sql_templates(cls: type) -> None:
+        """Pre-build INSERT and UPDATE SQL templates for this model."""
+        non_pk = {n: f for n, f in cls._fields.items() if not f.primary_key}
+        if not non_pk:
+            cls._insert_sql = ""
+            cls._update_sql = ""
+            cls._non_pk_field_names = ()
+            return
+
+        columns = [f.column_name for f in non_pk.values()]
+        placeholders = ", ".join("?" for _ in columns)
+        cls._insert_sql = (
+            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
+            f"VALUES ({placeholders})"
+        )
+
+        set_clause = ", ".join(f"{col} = ?" for col in columns)
+        pk_col = cls._pk_field.column_name if cls._pk_field else "id"
+        cls._update_sql = f"UPDATE {cls.table_name} SET {set_clause} WHERE {pk_col} = ?"
+
+        cls._non_pk_field_names = tuple(non_pk.keys())
 
 
 # ============================================================================
@@ -267,6 +242,9 @@ class Model(metaclass=MetaModel):
     _pk_field: ClassVar[Field | None]
     _pk_name: ClassVar[str]
     _reverse_relations: ClassVar[dict[str, ReverseRelationDescriptor]]
+    _insert_sql: ClassVar[str]
+    _update_sql: ClassVar[str]
+    _non_pk_field_names: ClassVar[tuple[str, ...]]
 
     def __init__(self, **kwargs: Any) -> None:
         for name, field in self._fields.items():
@@ -279,9 +257,34 @@ class Model(metaclass=MetaModel):
                 # PK is None until the row is inserted
                 self.__dict__[name] = None
 
-        # Track whether this instance has been persisted
         self._persisted = kwargs.get("_persisted", False)
         self._annotations: dict[str, Any] = kwargs.get("_annotations", {})
+        # Snapshot for dirty tracking
+        self._snapshot: dict[str, Any] = {}
+        if self._persisted:
+            self._take_snapshot()
+
+    def _take_snapshot(self) -> None:
+        """Snapshot current field values for dirty tracking."""
+        self._snapshot = {
+            name: self.__dict__.get(name) for name in self._non_pk_field_names
+        }
+
+    @property
+    def dirty_fields(self) -> dict[str, Any]:
+        """Return a dict of field names that have changed since load/last save."""
+        if not self._persisted:
+            return {n: self.__dict__.get(n) for n in self._non_pk_field_names}
+        return {
+            name: self.__dict__.get(name)
+            for name in self._non_pk_field_names
+            if self.__dict__.get(name) != self._snapshot.get(name)
+        }
+
+    @property
+    def is_dirty(self) -> bool:
+        """Return True if any fields have changed since load/last save."""
+        return bool(self.dirty_fields)
 
     def __repr__(self) -> str:
         pk = self.__dict__.get(self._pk_name)
@@ -308,14 +311,12 @@ class Model(metaclass=MetaModel):
 
     @classmethod
     def _create_index_sqls(cls) -> list[str]:
-        sqls: list[str] = []
-        for field in cls._fields.values():
-            if field.index and not field.primary_key:
-                sqls.append(
-                    f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{field.column_name} "
-                    f"ON {cls.table_name} ({field.column_name})"
-                )
-        return sqls
+        return [
+            f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{f.column_name} "
+            f"ON {cls.table_name} ({f.column_name})"
+            for f in cls._fields.values()
+            if f.index and not f.primary_key
+        ]
 
     @classmethod
     def create_table(cls, if_not_exists: bool = True) -> None:
@@ -369,7 +370,7 @@ class Model(metaclass=MetaModel):
             return field.to_db(value)
         if field.nullable:
             return _MISSING
-        raise ValueError(
+        raise MigrationError(
             f"Cannot migrate {cls.__name__}: new non-nullable column "
             f"'{field.column_name}' has no default"
         )
@@ -395,7 +396,7 @@ class Model(metaclass=MetaModel):
             if create_if_missing:
                 cls.create_table()
                 return
-            raise ValueError(f"Table '{cls.table_name}' does not exist")
+            raise MigrationError(f"Table '{cls.table_name}' does not exist")
 
         rename_fields = rename_fields or {}
         existing_columns = cls._existing_columns()
@@ -454,7 +455,10 @@ class Model(metaclass=MetaModel):
     # ---- CRUD -------------------------------------------------------------
 
     def save(self) -> None:
-        """Insert or update this instance in the database."""
+        """Insert or update this instance in the database.
+
+        Uses dirty tracking: only changed fields are sent in UPDATE statements.
+        """
         pk_value = self.__dict__.get(self._pk_name)
         for name, field in self._fields.items():
             value = self.__dict__.get(name)
@@ -463,35 +467,37 @@ class Model(metaclass=MetaModel):
             self._update()
         else:
             self._insert()
+        self._take_snapshot()
 
     async def asave(self) -> None:
         """Async version of :meth:`save`."""
         await asyncio.to_thread(self.save)
 
     def _insert(self) -> None:
-        non_pk_fields = {name: field for name, field in self._fields.items() if not field.primary_key}
-        columns = [f.column_name for f in non_pk_fields.values()]
-        values = [f.to_db(self.__dict__.get(name)) for name, f in non_pk_fields.items()]
-        placeholders = ", ".join("?" for _ in columns)
-        sql = (
-            f"INSERT INTO {self.table_name} ({', '.join(columns)}) "
-            f"VALUES ({placeholders})"
-        )
-        cursor = Database.execute(sql, values)
+        non_pk = self._non_pk_field_names
+        fields = self._fields
+        values = [fields[n].to_db(self.__dict__.get(n)) for n in non_pk]
+        cursor = Database.execute(self._insert_sql, values)
         self.__dict__[self._pk_name] = cursor.lastrowid
         self._persisted = True
 
     def _update(self) -> None:
-        non_pk_fields = {name: field for name, field in self._fields.items() if not field.primary_key}
-        set_clause = ", ".join(f"{f.column_name} = ?" for f in non_pk_fields.values())
-        values = [f.to_db(self.__dict__.get(name)) for name, f in non_pk_fields.items()]
+        dirty = self.dirty_fields
+        if not dirty:
+            return  # Nothing changed, skip the query
+
+        fields = self._fields
+        set_parts = []
+        values = []
+        for name, value in dirty.items():
+            f = fields[name]
+            set_parts.append(f"{f.column_name} = ?")
+            values.append(f.to_db(value))
+
         pk_value = self.__dict__[self._pk_name]
         values.append(pk_value)
-        pk_field = type(self)._pk_field
-        sql = (
-            f"UPDATE {self.table_name} SET {set_clause} "
-            f"WHERE {pk_field.column_name} = ?"
-        )
+        pk_col = type(self)._pk_field.column_name
+        sql = f"UPDATE {self.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
         Database.execute(sql, values)
 
     def delete(self) -> None:
@@ -499,9 +505,11 @@ class Model(metaclass=MetaModel):
         pk_value = self.__dict__.get(self._pk_name)
         if pk_value is None:
             raise RecordNotFoundError("Cannot delete an unsaved instance")
-        pk_field = type(self)._pk_field
-        sql = f"DELETE FROM {self.table_name} WHERE {pk_field.column_name} = ?"
-        Database.execute(sql, [pk_value])
+        pk_col = type(self)._pk_field.column_name
+        Database.execute(
+            f"DELETE FROM {self.table_name} WHERE {pk_col} = ?",
+            [pk_value],
+        )
         self.__dict__[self._pk_name] = None
         self._persisted = False
 
@@ -514,9 +522,11 @@ class Model(metaclass=MetaModel):
         pk_value = self.__dict__.get(self._pk_name)
         if pk_value is None:
             raise RecordNotFoundError("Cannot refresh an unsaved instance")
-        pk_field = type(self)._pk_field
-        sql = f"SELECT * FROM {self.table_name} WHERE {pk_field.column_name} = ?"
-        row = Database.fetchone(sql, [pk_value])
+        pk_col = type(self)._pk_field.column_name
+        row = Database.fetchone(
+            f"SELECT * FROM {self.table_name} WHERE {pk_col} = ?",
+            [pk_value],
+        )
         if row is None:
             raise RecordNotFoundError(
                 f"{type(self).__name__} with pk={pk_value} not found"
@@ -529,6 +539,7 @@ class Model(metaclass=MetaModel):
                 # Clear FK caches on refresh
                 if isinstance(field, ForeignKeyField):
                     self.__dict__.pop(field.cache_attr_name, None)
+        self._take_snapshot()
 
     async def arefresh(self) -> None:
         """Async version of :meth:`refresh`."""
@@ -570,27 +581,24 @@ class Model(metaclass=MetaModel):
     # ---- Construction from DB rows ----------------------------------------
 
     @classmethod
-    def _from_row(
-        cls,
-        row_dict: dict[str, Any],
-        *,
-        annotations: dict[str, Any] | None = None,
-    ) -> Model:
+    def _from_row(cls, row_dict: dict[str, Any], *, annotations: dict[str, Any] | None = None) -> Model:
         """Construct a model instance from a database row dict."""
-        kwargs: dict[str, Any] = {}
+        instance = cls.__new__(cls)
+        d = instance.__dict__
         for name, field in cls._fields.items():
             col = field.column_name
             if col in row_dict:
                 raw = row_dict[col]
-                kwargs[name] = field.to_python(raw) if raw is not None else None
-        instance = cls.__new__(cls)
-        Model.__init__(instance, **kwargs, _persisted=True)
-        instance._annotations = annotations or {}
-        for alias, value in instance._annotations.items():
-            setattr(instance, alias, value)
+                d[name] = field.to_python(raw) if raw is not None else None
+        d["_persisted"] = True
+        ann = annotations or {}
+        d["_annotations"] = ann
+        d["_snapshot"] = {name: d.get(name) for name in cls._non_pk_field_names}
+        for alias, value in ann.items():
+            d[alias] = value
         return instance
 
-    # ---- Create / get_or_create -------------------------------------------
+    # ---- Create / get_or_create / update_or_create ------------------------
 
     @classmethod
     def create(cls, **kwargs: Any) -> Model:
@@ -613,49 +621,56 @@ class Model(metaclass=MetaModel):
         except RecordNotFoundError:
             if defaults:
                 kwargs.update(defaults)
-            instance = cls.create(**kwargs)
-            return instance, True
+            return cls.create(**kwargs), True
 
     @classmethod
     async def aget_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
         """Async version of :meth:`get_or_create`."""
         return await asyncio.to_thread(cls.get_or_create, defaults, **kwargs)
 
+    @classmethod
+    def update_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
+        """Fetch and update if exists, otherwise create.
+
+        Returns ``(instance, created)`` where *created* is ``True`` if a new
+        row was inserted.
+        """
+        defaults = defaults or {}
+        try:
+            instance = cls.get(**kwargs)
+            for key, val in defaults.items():
+                setattr(instance, key, val)
+            instance.save()
+            return instance, False
+        except RecordNotFoundError:
+            kwargs.update(defaults)
+            return cls.create(**kwargs), True
+
+    @classmethod
+    async def aupdate_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
+        """Async version of :meth:`update_or_create`."""
+        return await asyncio.to_thread(cls.update_or_create, defaults, **kwargs)
+
     # ---- Bulk operations --------------------------------------------------
 
     @classmethod
-    def bulk_create(
-        cls,
-        items: list[dict[str, Any]],
-        *,
-        validate: bool = True,
-    ) -> list[Model]:
+    def bulk_create(cls, items: list[dict[str, Any]], *, validate: bool = True) -> list[Model]:
         """Insert many rows efficiently and return the instances.
 
-        When *validate* is ``True`` (default), each value is validated
-        against its field constraints before insertion.  Set to ``False``
-        to skip validation for maximum throughput with trusted data.
+        Uses ``INSERT ... RETURNING`` (SQLite 3.35+) for efficient retrieval.
         """
         if not items:
             return []
 
-        non_pk_fields = {
-            name: field
-            for name, field in cls._fields.items()
-            if not field.primary_key
-        }
-        columns = [f.column_name for f in non_pk_fields.values()]
+        non_pk = {n: f for n, f in cls._fields.items() if not f.primary_key}
+        columns = [f.column_name for f in non_pk.values()]
         placeholders = ", ".join("?" for _ in columns)
-        sql = (
-            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
-            f"VALUES ({placeholders})"
-        )
 
         errors: list[str] = []
         params_seq = []
         for idx, item in enumerate(items):
             row_values = []
-            for name, field in non_pk_fields.items():
+            for name, field in non_pk.items():
                 val = item.get(name)
                 if val is None and field.default is not _MISSING:
                     val = field.default() if callable(field.default) else field.default
@@ -673,24 +688,105 @@ class Model(metaclass=MetaModel):
                 + "\n".join(errors)
             )
 
-        Database.executemany(sql, params_seq)
-
-        # Fetch the inserted rows (SQLite doesn't return multiple lastrowids)
-        fetch_sql = (
-            f"SELECT * FROM {cls.table_name} ORDER BY rowid DESC LIMIT {len(items)}"
+        # Use RETURNING for efficient row retrieval (SQLite 3.35+)
+        returning_cols = ", ".join(f.column_name for f in cls._fields.values())
+        sql = (
+            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) RETURNING {returning_cols}"
         )
-        rows = Database.fetchall(fetch_sql)
-        return [cls._from_row(dict(r)) for r in reversed(rows)]
+
+        instances = []
+        conn = Database.get_connection()
+        with Database._write_lock:
+            try:
+                for row_params in params_seq:
+                    cursor = conn.execute(sql, row_params)
+                    row = cursor.fetchone()
+                    if row is not None:
+                        instances.append(cls._from_row(dict(row)))
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        return instances
 
     @classmethod
-    async def abulk_create(
-        cls,
-        items: list[dict[str, Any]],
-        *,
-        validate: bool = True,
-    ) -> list[Model]:
+    async def abulk_create(cls, items: list[dict[str, Any]], *, validate: bool = True) -> list[Model]:
         """Async version of :meth:`bulk_create`."""
         return await asyncio.to_thread(cls.bulk_create, items, validate=validate)
+
+    @classmethod
+    def bulk_update(
+        cls,
+        instances: list[Model],
+        fields: list[str] | None = None,
+    ) -> int:
+        """Bulk UPDATE a list of model instances.
+
+        Args:
+            instances: Model instances to update (must be persisted).
+            fields: Specific field names to update. If ``None``, updates
+                all non-PK fields.
+
+        Returns:
+            Number of rows affected.
+        """
+        if not instances:
+            return 0
+
+        update_fields = fields or list(cls._non_pk_field_names)
+        pk_col = cls._pk_field.column_name
+
+        total = 0
+        conn = Database.get_connection()
+        with Database._write_lock:
+            try:
+                for instance in instances:
+                    pk_value = instance.__dict__.get(instance._pk_name)
+                    if pk_value is None:
+                        continue
+                    set_parts = []
+                    values = []
+                    for name in update_fields:
+                        f = cls._fields[name]
+                        set_parts.append(f"{f.column_name} = ?")
+                        values.append(f.to_db(instance.__dict__.get(name)))
+                    if not set_parts:
+                        continue
+                    values.append(pk_value)
+                    sql = f"UPDATE {cls.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
+                    cursor = conn.execute(sql, values)
+                    total += cursor.rowcount
+                conn.commit()
+            except Exception:
+                conn.rollback()
+                raise
+
+        for instance in instances:
+            instance._take_snapshot()
+        return total
+
+    @classmethod
+    async def abulk_update(cls, instances: list[Model], fields: list[str] | None = None) -> int:
+        """Async version of :meth:`bulk_update`."""
+        return await asyncio.to_thread(cls.bulk_update, instances, fields)
+
+    # ---- Raw SQL ----------------------------------------------------------
+
+    @classmethod
+    def raw(cls, sql: str, params: Any = None) -> list[Model]:
+        """Execute raw SQL and return model instances.
+
+        The SQL must return columns matching the model's field column names.
+        """
+        rows = Database.fetchall(sql, params)
+        return [cls._from_row(dict(r)) for r in rows]
+
+    @classmethod
+    async def araw(cls, sql: str, params: Any = None) -> list[Model]:
+        """Async version of :meth:`raw`."""
+        return await asyncio.to_thread(cls.raw, sql, params)
 
     # ---- QuerySet bridge ---------------------------------------------------
 
@@ -730,6 +826,34 @@ class Model(metaclass=MetaModel):
     @classmethod
     def annotate(cls, **annotations: Any) -> QuerySet:
         return cls._queryset().annotate(**annotations)
+
+    @classmethod
+    def values(cls, *fields: str) -> QuerySet:
+        return cls._queryset().values(*fields)
+
+    @classmethod
+    def values_list(cls, *fields: str, flat: bool = False) -> QuerySet:
+        return cls._queryset().values_list(*fields, flat=flat)
+
+    @classmethod
+    def only(cls, *fields: str) -> QuerySet:
+        return cls._queryset().only(*fields)
+
+    @classmethod
+    def defer(cls, *fields: str) -> QuerySet:
+        return cls._queryset().defer(*fields)
+
+    @classmethod
+    def distinct(cls) -> QuerySet:
+        return cls._queryset().distinct()
+
+    @classmethod
+    def group_by(cls, *fields: str) -> QuerySet:
+        return cls._queryset().group_by(*fields)
+
+    @classmethod
+    def iterator(cls, chunk_size: int = 2000):
+        return cls._queryset().iterator(chunk_size=chunk_size)
 
     @classmethod
     def all(cls) -> list[Model]:
@@ -778,4 +902,3 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def aaggregate(cls, func: str, field: str) -> Any:
         return await cls._queryset().aaggregate(func, field)
-

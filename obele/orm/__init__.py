@@ -8,6 +8,8 @@ from .exceptions import (
     MultipleResultsError,
     DatabaseError,
     IntegrityError,
+    MigrationError,
+    ConfigurationError,
 )
 from .fields import (
     Field,
@@ -17,6 +19,9 @@ from .fields import (
     BlobField,
     BooleanField,
     DateTimeField,
+    DateField,
+    TimestampField,
+    JSONField,
     ForeignKeyField,
 )
 from .model import Model, ReverseRelationManager, ReverseRelationDescriptor
@@ -46,6 +51,9 @@ __all__ = [
     "BlobField",
     "BooleanField",
     "DateTimeField",
+    "DateField",
+    "TimestampField",
+    "JSONField",
     "ForeignKeyField",
     "ORMError",
     "FieldValidationError",
@@ -53,5 +61,6 @@ __all__ = [
     "MultipleResultsError",
     "DatabaseError",
     "IntegrityError",
+    "MigrationError",
+    "ConfigurationError",
 ]
-

@@ -21,5 +21,13 @@ class DatabaseError(ORMError):
     """Wraps sqlite3.Error for ORM-level handling."""
 
 
-class IntegrityError(ORMError):
+class IntegrityError(DatabaseError):
     """Wraps sqlite3.IntegrityError for constraint violations."""
+
+
+class MigrationError(ORMError):
+    """Raised when a schema migration fails."""
+
+
+class ConfigurationError(ORMError):
+    """Raised when Database.configure() is called with invalid arguments."""

@@ -2,11 +2,7 @@
 
 Provides :class:`KVStore`, a :class:`~collections.abc.MutableMapping` with
 support for sorted iteration, slicing, range queries, multi-key lookups,
-batch writes, and pluggable serialization (auto / JSON / pickle / custom).
-
-The table uses dedicated sort columns (``key_int``, ``key_real``,
-``key_text``, ``key_blob``) so that ordered queries are performed natively
-by SQLite, while a ``lookup_key`` BLOB column guarantees exact key identity.
+batch writes, TTL expiration, and pluggable serialization.
 
 Usage::
 
@@ -20,6 +16,9 @@ Usage::
     print(store["theme"])             # "dark"
     print(store["a":"z"])             # dict of all keys in [a, z)
 
+    # TTL support
+    store.set("temp", "value", ttl=300)  # expires in 5 minutes
+
     # Multi-key
     store.get_many("theme", "lang")   # {"theme": "dark", "lang": "en"}
 """
@@ -31,6 +30,7 @@ import json
 import math
 import pickle
 import re
+import time
 from collections.abc import Hashable, Iterable, Iterator, Mapping, MutableMapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Callable, Literal
@@ -43,11 +43,12 @@ _Loads = Callable[[bytes], Any]
 SerializerMode = Literal["auto", "json", "pickle"]
 MultiGetReturn = Literal["dict", "tuple"]
 
-
 _IDENTIFIER_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
 _MISSING = object()
 
-_SORTABLE_KEY_TYPES: dict[type[Any], str] = {int: "int", float: "float", str: "str",bytes: "bytes",}
+_SORTABLE_KEY_TYPES: dict[type[Any], str] = {
+    int: "int", float: "float", str: "str", bytes: "bytes",
+}
 _SORTABLE_KEY_FORMATS: dict[str, type[Any]] = {v: k for k, v in _SORTABLE_KEY_TYPES.items()}
 
 
@@ -72,7 +73,6 @@ def _json_safe_encode(value: Any) -> bytes:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
         raise TypeError("JSON serialization failed for the provided value") from exc
-    # Round-trip check: ensure JSON faithfully represents the value.
     round_tripped = json.loads(text)
     if type(round_tripped) is not type(value) or round_tripped != value:
         raise TypeError("JSON serialization would not preserve the original value type")
@@ -96,6 +96,36 @@ class _EncodedValue:
     value_payload: bytes
 
 
+# SQL fragments cached per-table to avoid repeated f-string allocation
+_UPSERT_SQL_CACHE: dict[str, str] = {}
+
+
+def _get_upsert_sql(table: str) -> str:
+    """Return the cached UPSERT SQL template for a table."""
+    sql = _UPSERT_SQL_CACHE.get(table)
+    if sql is None:
+        sql = f"""
+            INSERT INTO {table} (
+                lookup_key, key_format, key_payload,
+                key_int, key_real, key_text, key_blob,
+                value_format, value_payload, expires_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(lookup_key) DO UPDATE SET
+                key_format     = excluded.key_format,
+                key_payload    = excluded.key_payload,
+                key_int        = excluded.key_int,
+                key_real       = excluded.key_real,
+                key_text       = excluded.key_text,
+                key_blob       = excluded.key_blob,
+                value_format   = excluded.value_format,
+                value_payload  = excluded.value_payload,
+                expires_at     = excluded.expires_at
+        """
+        _UPSERT_SQL_CACHE[table] = sql
+    return sql
+
+
 class KVStore(MutableMapping[Any, Any]):
     """A fast, single-table key-value store with a dict-like interface.
 
@@ -105,19 +135,17 @@ class KVStore(MutableMapping[Any, Any]):
         SQLite table name (must be a valid identifier).
     key_type:
         Optional Python type constraining keys - ``int``, ``float``,
-        ``str``, or ``bytes``.  When *enforce_key_type* is ``True``,
-        the store auto-detects the type from the first inserted key if
-        *key_type* is ``None``.
+        ``str``, or ``bytes``.
     enforce_key_type:
         When ``True`` (default), all keys must share the same sortable
-        type, enabling ordered iteration, slicing, and range queries.
-        Set to ``False`` for mixed-type keys (sorting/range becomes
-        undefined).
+        type, enabling ordered iteration and range queries.
     serializer:
         ``"auto"`` (default) tries JSON first then falls back to pickle.
         ``"json"`` forces JSON-only.  ``"pickle"`` forces pickle-only.
-        A ``(dumps, loads)`` callable pair can also be supplied for
-        custom serialization.
+        A ``(dumps, loads)`` callable pair for custom serialization.
+    namespace:
+        Optional string prefix applied to all keys, enabling multiple
+        logical stores in one table.
     """
 
     def __init__(
@@ -127,6 +155,7 @@ class KVStore(MutableMapping[Any, Any]):
         key_type: type[Any] | None = None,
         enforce_key_type: bool = True,
         serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
+        namespace: str | None = None,
     ) -> None:
         self._table = _validate_identifier(table_name)
         self._enforce = enforce_key_type
@@ -135,6 +164,7 @@ class KVStore(MutableMapping[Any, Any]):
         self._resolved_key_format: str | None = (
             _SORTABLE_KEY_TYPES.get(key_type) if key_type else None
         )
+        self._namespace = namespace
 
         if enforce_key_type and key_type is not None and key_type not in _SORTABLE_KEY_TYPES:
             raise TypeError(
@@ -173,6 +203,22 @@ class KVStore(MutableMapping[Any, Any]):
         return self._resolved_key_type
 
     # ------------------------------------------------------------------
+    # Namespace support
+    # ------------------------------------------------------------------
+
+    def _apply_namespace(self, key: Any) -> Any:
+        """Prefix a key with the namespace if configured."""
+        if self._namespace and isinstance(key, str):
+            return f"{self._namespace}:{key}"
+        return key
+
+    def _strip_namespace(self, key: Any) -> Any:
+        """Remove the namespace prefix from a key."""
+        if self._namespace and isinstance(key, str) and key.startswith(f"{self._namespace}:"):
+            return key[len(self._namespace) + 1:]
+        return key
+
+    # ------------------------------------------------------------------
     # Table management
     # ------------------------------------------------------------------
 
@@ -189,7 +235,8 @@ class KVStore(MutableMapping[Any, Any]):
                 key_text     TEXT,
                 key_blob     BLOB,
                 value_format TEXT NOT NULL,
-                value_payload BLOB NOT NULL
+                value_payload BLOB NOT NULL,
+                expires_at   REAL
             ) WITHOUT ROWID
             """
         )
@@ -235,11 +282,7 @@ class KVStore(MutableMapping[Any, Any]):
         self._resolved_key_format = existing_format
 
     def create_table(self, if_not_exists: bool = True) -> None:
-        """Explicitly (re-)create the backing table.
-
-        Normally called automatically by ``__init__``.  Use this when
-        you need to recreate a table after :meth:`drop_table`.
-        """
+        """Explicitly (re-)create the backing table."""
         self._ensure_table()
 
     async def acreate_table(self, if_not_exists: bool = True) -> None:
@@ -256,6 +299,31 @@ class KVStore(MutableMapping[Any, Any]):
         await asyncio.to_thread(self.drop_table, if_exists)
 
     # ------------------------------------------------------------------
+    # TTL support
+    # ------------------------------------------------------------------
+
+    def _now(self) -> float:
+        """Current time as a Unix timestamp."""
+        return time.time()
+
+    def _is_expired(self, row: Mapping[str, Any]) -> bool:
+        """Check if a row has expired based on its expires_at field."""
+        expires_at = row.get("expires_at") if isinstance(row, dict) else row["expires_at"]
+        return expires_at is not None and expires_at <= self._now()
+
+    def purge_expired(self) -> int:
+        """Delete all expired entries. Returns number of rows removed."""
+        cursor = Database.execute(
+            f"DELETE FROM {self._table} WHERE expires_at IS NOT NULL AND expires_at <= ?",
+            [self._now()],
+        )
+        return cursor.rowcount
+
+    async def apurge_expired(self) -> int:
+        """Async version of :meth:`purge_expired`."""
+        return await asyncio.to_thread(self.purge_expired)
+
+    # ------------------------------------------------------------------
     # MutableMapping core interface
     # ------------------------------------------------------------------
 
@@ -263,10 +331,17 @@ class KVStore(MutableMapping[Any, Any]):
         if isinstance(key, slice):
             return self.range(key.start, key.stop, step=key.step)
 
+        key = self._apply_namespace(key)
         encoded = self._encode_key(key)
         row = self._fetch_row(encoded.lookup_key)
-        if row is None:
-            raise KeyError(key)
+        if row is None or self._is_expired(row):
+            if row is not None:
+                # Lazy cleanup of expired entry
+                Database.execute(
+                    f"DELETE FROM {self._table} WHERE lookup_key = ?",
+                    [encoded.lookup_key],
+                )
+            raise KeyError(self._strip_namespace(key))
         return self._decode_value(row["value_format"], row["value_payload"])
 
     def __setitem__(self, key: Any, value: Any) -> None:
@@ -279,35 +354,49 @@ class KVStore(MutableMapping[Any, Any]):
         if isinstance(key, slice):
             return False
         try:
+            key = self._apply_namespace(key)
             encoded = self._encode_key(key)
         except (TypeError, ValueError, pickle.PickleError):
             return False
-        return (
-            Database.fetchone(
-                f"SELECT 1 FROM {self._table} WHERE lookup_key = ? LIMIT 1",
+        row = Database.fetchone(
+            f"SELECT expires_at FROM {self._table} WHERE lookup_key = ? LIMIT 1",
+            [encoded.lookup_key],
+        )
+        if row is None:
+            return False
+        if self._is_expired(row):
+            Database.execute(
+                f"DELETE FROM {self._table} WHERE lookup_key = ?",
                 [encoded.lookup_key],
             )
-            is not None
-        )
+            return False
+        return True
 
     def __len__(self) -> int:
         count = Database.fetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table}",
+            f"SELECT COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE expires_at IS NULL OR expires_at > ?",
+            [self._now()],
             column="cnt",
         )
         return int(count or 0)
 
     def __bool__(self) -> bool:
-        return len(self) > 0
+        row = Database.fetchone(
+            f"SELECT 1 FROM {self._table} "
+            f"WHERE expires_at IS NULL OR expires_at > ? LIMIT 1",
+            [self._now()],
+        )
+        return row is not None
 
     def __iter__(self) -> Iterator[Any]:
         for row in self._select_rows():
-            yield self._decode_key(row)
+            yield self._strip_namespace(self._decode_key(row))
 
     def __repr__(self) -> str:
         key_name = self._resolved_key_type.__name__ if self._resolved_key_type else "unset"
         return (
-            f"<KVStore table={self._table!r} size={len(self)} "
+            f"<KVStore table={self._table!r} "
             f"key_type={key_name} enforce={self._enforce}>"
         )
 
@@ -322,31 +411,25 @@ class KVStore(MutableMapping[Any, Any]):
         except KeyError:
             return default
 
-    def set(self, key: Any, value: Any, *, serializer: SerializerMode | None = None) -> None:
+    def set(
+        self,
+        key: Any,
+        value: Any,
+        *,
+        serializer: SerializerMode | None = None,
+        ttl: float | int | None = None,
+    ) -> None:
         """Insert or replace a single key-value pair.
 
-        An optional per-call *serializer* override can be supplied.
+        Args:
+            serializer: Per-call serializer override.
+            ttl: Time-to-live in seconds. ``None`` means no expiration.
         """
+        key = self._apply_namespace(key)
         encoded_key = self._encode_key(key)
         encoded_value = self._encode_value(value, serializer)
-        sql = f"""
-            INSERT INTO {self._table} (
-                lookup_key, key_format, key_payload,
-                key_int, key_real, key_text, key_blob,
-                value_format, value_payload
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(lookup_key) DO UPDATE SET
-                key_format     = excluded.key_format,
-                key_payload    = excluded.key_payload,
-                key_int        = excluded.key_int,
-                key_real       = excluded.key_real,
-                key_text       = excluded.key_text,
-                key_blob       = excluded.key_blob,
-                value_format   = excluded.value_format,
-                value_payload  = excluded.value_payload
-        """
-        Database.execute(sql, [
+        expires_at = (self._now() + ttl) if ttl is not None else None
+        Database.execute(_get_upsert_sql(self._table), [
             encoded_key.lookup_key,
             encoded_key.key_format,
             encoded_key.key_payload,
@@ -356,14 +439,11 @@ class KVStore(MutableMapping[Any, Any]):
             encoded_key.key_blob,
             encoded_value.value_format,
             encoded_value.value_payload,
+            expires_at,
         ])
 
     def pop(self, key: Any, *args: Any) -> Any:
-        """Remove and return the value for *key*.
-
-        If *key* is missing and a *default* is given, return it;
-        otherwise raise ``KeyError``.
-        """
+        """Remove and return the value for *key*."""
         try:
             value = self[key]
         except KeyError:
@@ -374,16 +454,12 @@ class KVStore(MutableMapping[Any, Any]):
         return value
 
     def popitem(self, last: bool = True) -> tuple[Any, Any]:
-        """Remove and return an arbitrary ``(key, value)`` pair.
-
-        When *last* is ``True`` (default), removes the last key in sort
-        order; when ``False``, the first.
-        """
+        """Remove and return an arbitrary ``(key, value)`` pair."""
         rows = self._select_rows(limit=1, reverse=last)
         if not rows:
             raise KeyError("store is empty")
         row = rows[0]
-        key = self._decode_key(row)
+        key = self._strip_namespace(self._decode_key(row))
         value = self._decode_value(row["value_format"], row["value_payload"])
         self.delete(key)
         return key, value
@@ -414,7 +490,7 @@ class KVStore(MutableMapping[Any, Any]):
 
     def keys(self) -> list[Any]:
         """Return all keys, in sort order."""
-        return [self._decode_key(row) for row in self._select_rows()]
+        return [self._strip_namespace(self._decode_key(row)) for row in self._select_rows()]
 
     def values(self) -> list[Any]:
         """Return all values, ordered by key."""
@@ -426,20 +502,49 @@ class KVStore(MutableMapping[Any, Any]):
     def items(self) -> list[tuple[Any, Any]]:
         """Return all ``(key, value)`` pairs, ordered by key."""
         return [
-            (self._decode_key(row),
+            (self._strip_namespace(self._decode_key(row)),
              self._decode_value(row["value_format"], row["value_payload"]))
             for row in self._select_rows()
         ]
 
     def delete(self, key: Any) -> None:
         """Delete a single key. Raises ``KeyError`` if not present."""
+        key = self._apply_namespace(key)
         encoded = self._encode_key(key)
         cursor = Database.execute(
             f"DELETE FROM {self._table} WHERE lookup_key = ?",
             [encoded.lookup_key],
         )
         if cursor.rowcount == 0:
-            raise KeyError(key)
+            raise KeyError(self._strip_namespace(key))
+
+    # ------------------------------------------------------------------
+    # Atomic operations
+    # ------------------------------------------------------------------
+
+    def increment(self, key: Any, delta: int | float = 1) -> int | float:
+        """Atomically increment a numeric value. Creates the key if missing.
+
+        Args:
+            key: The key to increment.
+            delta: Amount to add (default 1). Can be negative.
+
+        Returns:
+            The new value after incrementing.
+        """
+        try:
+            current = self[key]
+            if not isinstance(current, (int, float)):
+                raise TypeError(f"Cannot increment non-numeric value: {type(current).__name__}")
+            new_value = current + delta
+        except KeyError:
+            new_value = delta
+        self[key] = new_value
+        return new_value
+
+    async def aincrement(self, key: Any, delta: int | float = 1) -> int | float:
+        """Async version of :meth:`increment`."""
+        return await asyncio.to_thread(self.increment, key, delta)
 
     # ------------------------------------------------------------------
     # Batch operations
@@ -450,6 +555,7 @@ class KVStore(MutableMapping[Any, Any]):
         items: Mapping[Any, Any] | Iterable[tuple[Any, Any]],
         *,
         serializer: SerializerMode | None = None,
+        ttl: float | int | None = None,
     ) -> None:
         """Insert or replace many key-value pairs efficiently."""
         if isinstance(items, Mapping):
@@ -459,31 +565,17 @@ class KVStore(MutableMapping[Any, Any]):
         if not pairs:
             return
 
-        sql = f"""
-            INSERT INTO {self._table} (
-                lookup_key, key_format, key_payload,
-                key_int, key_real, key_text, key_blob,
-                value_format, value_payload
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(lookup_key) DO UPDATE SET
-                key_format     = excluded.key_format,
-                key_payload    = excluded.key_payload,
-                key_int        = excluded.key_int,
-                key_real       = excluded.key_real,
-                key_text       = excluded.key_text,
-                key_blob       = excluded.key_blob,
-                value_format   = excluded.value_format,
-                value_payload  = excluded.value_payload
-        """
+        expires_at = (self._now() + ttl) if ttl is not None else None
+        sql = _get_upsert_sql(self._table)
         params_seq: list[list[Any]] = []
         for key, value in pairs:
+            key = self._apply_namespace(key)
             ek = self._encode_key(key)
             ev = self._encode_value(value, serializer)
             params_seq.append([
                 ek.lookup_key, ek.key_format, ek.key_payload,
                 ek.key_int, ek.key_real, ek.key_text, ek.key_blob,
-                ev.value_format, ev.value_payload,
+                ev.value_format, ev.value_payload, expires_at,
             ])
         Database.executemany(sql, params_seq)
 
@@ -492,7 +584,7 @@ class KVStore(MutableMapping[Any, Any]):
         keys_list = list(keys)
         if not keys_list:
             return 0
-        encoded_keys = [self._encode_key(k).lookup_key for k in keys_list]
+        encoded_keys = [self._encode_key(self._apply_namespace(k)).lookup_key for k in keys_list]
         placeholders = ", ".join("?" for _ in encoded_keys)
         cursor = Database.execute(
             f"DELETE FROM {self._table} WHERE lookup_key IN ({placeholders})",
@@ -511,32 +603,22 @@ class KVStore(MutableMapping[Any, Any]):
         default: Any = _MISSING,
         skip_missing: bool = False,
     ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Fetch many keys at once.
-
-        Parameters
-        ----------
-        *keys:
-            Keys to look up.
-        return_type:
-            ``"dict"`` (default) returns a ``{key: value}`` dict;
-            ``"tuple"`` returns a tuple of ``(key, value)`` pairs.
-        default:
-            Value to substitute for missing keys.  If omitted and a key
-            is missing (and *skip_missing* is ``False``), ``KeyError``
-            is raised.
-        skip_missing:
-            When ``True``, silently omit keys not found in the store.
-        """
+        """Fetch many keys at once."""
         if not keys:
             return {} if return_type == "dict" else ()
 
-        encoded_pairs = [(k, self._encode_key(k)) for k in keys]
+        encoded_pairs = [(k, self._encode_key(self._apply_namespace(k))) for k in keys]
         placeholders = ", ".join("?" for _ in encoded_pairs)
-        cursor = Database.execute_read(
+        rows_raw = Database.fetchall(
             f"SELECT * FROM {self._table} WHERE lookup_key IN ({placeholders})",
             [enc.lookup_key for _, enc in encoded_pairs],
         )
-        rows = {bytes(row["lookup_key"]): row for row in cursor.fetchall()}
+        now = self._now()
+        rows = {
+            bytes(row["lookup_key"]): row
+            for row in rows_raw
+            if row["expires_at"] is None or row["expires_at"] > now
+        }
 
         pairs: list[tuple[Any, Any]] = []
         for original_key, encoded in encoded_pairs:
@@ -570,18 +652,6 @@ class KVStore(MutableMapping[Any, Any]):
         """Return items whose keys lie in ``[start, stop)``.
 
         Requires ``enforce_key_type=True`` with a sortable key type.
-
-        Parameters
-        ----------
-        start, stop:
-            Inclusive lower / exclusive upper bounds.  ``None`` means
-            unbounded.
-        step:
-            Select every *step*-th result (client-side).
-        reverse:
-            When ``True``, return items in descending key order.
-        return_type:
-            ``"dict"`` or ``"tuple"``.
         """
         if step is not None:
             if step == 0:
@@ -590,11 +660,8 @@ class KVStore(MutableMapping[Any, Any]):
                 raise ValueError("negative steps are not supported; use reverse=True")
 
         if not self._enforce:
-            raise TypeError(
-                "range / slice queries require enforce_key_type=True with sortable keys"
-            )
+            raise TypeError("range / slice queries require enforce_key_type=True")
 
-        # Auto-detect key type if store is non-empty but type hasn't been resolved yet.
         if self._resolved_key_type is None:
             if len(self) == 0:
                 return {} if return_type == "dict" else ()
@@ -605,7 +672,11 @@ class KVStore(MutableMapping[Any, Any]):
 
         column = self._sortable_column_for_format(self._resolved_key_format)
         params: list[Any] = [self._resolved_key_format]
-        where_clauses = ["key_format = ?"]
+        where_clauses = [
+            "key_format = ?",
+            "(expires_at IS NULL OR expires_at > ?)",
+        ]
+        params.append(self._now())
 
         if start is not None:
             self._ensure_range_key_type(start)
@@ -624,7 +695,7 @@ class KVStore(MutableMapping[Any, Any]):
         )
         rows = Database.fetchall(sql, params)
         pairs = [
-            (self._decode_key(row),
+            (self._strip_namespace(self._decode_key(row)),
              self._decode_value(row["value_format"], row["value_payload"]))
             for row in rows
         ]
@@ -662,9 +733,7 @@ class KVStore(MutableMapping[Any, Any]):
 
     def _encode_key(self, key: Any) -> _EncodedKey:
         _ensure_hashable(key)
-        if self._enforce:
-            return self._encode_sortable_key(key)
-        return self._encode_flexible_key(key)
+        return self._encode_sortable_key(key) if self._enforce else self._encode_flexible_key(key)
 
     def _encode_sortable_key(self, key: Any) -> _EncodedKey:
         key_type = type(key)
@@ -675,14 +744,12 @@ class KVStore(MutableMapping[Any, Any]):
                 f"got {key_type.__name__}"
             )
 
-        # Auto-lock to the first key type seen.
         if self._resolved_key_type is None:
             self._resolved_key_type = key_type
             self._resolved_key_format = key_format
         elif key_type is not self._resolved_key_type:
             raise TypeError(
-                f"expected {self._resolved_key_type.__name__} keys, "
-                f"got {key_type.__name__}"
+                f"expected {self._resolved_key_type.__name__} keys, got {key_type.__name__}"
             )
 
         return self._build_sortable_encoded_key(key, key_type, key_format)
@@ -690,14 +757,13 @@ class KVStore(MutableMapping[Any, Any]):
     def _encode_flexible_key(self, key: Any) -> _EncodedKey:
         key_type = type(key)
         if key_type in _SORTABLE_KEY_TYPES:
-            key_format = _SORTABLE_KEY_TYPES[key_type]
-            return self._build_sortable_encoded_key(key, key_type, key_format)
-
+            return self._build_sortable_encoded_key(
+                key, key_type, _SORTABLE_KEY_TYPES[key_type],
+            )
         try:
             payload = pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)
         except pickle.PickleError as exc:
             raise TypeError("key is not picklable") from exc
-
         return _EncodedKey(
             lookup_key=b"pickle:" + payload,
             key_format="pickle",
@@ -708,38 +774,22 @@ class KVStore(MutableMapping[Any, Any]):
     def _build_sortable_encoded_key(key: Any, key_type: type, key_format: str) -> _EncodedKey:
         if key_type is int:
             payload = str(key).encode("ascii")
-            return _EncodedKey(
-                lookup_key=b"int:" + payload,
-                key_format="int",
-                key_payload=payload,
-                key_int=key,
-            )
+            return _EncodedKey(lookup_key=b"int:" + payload, key_format="int",
+                               key_payload=payload, key_int=key)
         if key_type is float:
             if not math.isfinite(key):
                 raise ValueError("float keys must be finite")
             payload = repr(key).encode("ascii")
-            return _EncodedKey(
-                lookup_key=b"float:" + payload,
-                key_format="float",
-                key_payload=payload,
-                key_real=key,
-            )
+            return _EncodedKey(lookup_key=b"float:" + payload, key_format="float",
+                               key_payload=payload, key_real=key)
         if key_type is str:
             payload = key.encode("utf-8")
-            return _EncodedKey(
-                lookup_key=b"str:" + payload,
-                key_format="str",
-                key_payload=payload,
-                key_text=key,
-            )
+            return _EncodedKey(lookup_key=b"str:" + payload, key_format="str",
+                               key_payload=payload, key_text=key)
         # bytes
         payload = bytes(key)
-        return _EncodedKey(
-            lookup_key=b"bytes:" + payload,
-            key_format="bytes",
-            key_payload=payload,
-            key_blob=payload,
-        )
+        return _EncodedKey(lookup_key=b"bytes:" + payload, key_format="bytes",
+                           key_payload=payload, key_blob=payload)
 
     # ------------------------------------------------------------------
     # Value encoding / decoding
@@ -748,12 +798,9 @@ class KVStore(MutableMapping[Any, Any]):
     def _encode_value(self, value: Any, serializer: SerializerMode | None = None) -> _EncodedValue:
         mode = serializer or self._serializer_mode
 
-        # Custom callable serializer
         if mode == "custom":
-            payload = self._custom_dumps(value)
-            return _EncodedValue("custom", payload)
+            return _EncodedValue("custom", self._custom_dumps(value))
 
-        # Auto: try JSON, fallback to pickle
         if mode in ("auto", "json"):
             try:
                 payload = _json_safe_encode(value)
@@ -762,7 +809,6 @@ class KVStore(MutableMapping[Any, Any]):
                 if mode == "json":
                     raise
 
-        # pickle fallback (or explicit "pickle")
         return _EncodedValue(
             "pickle",
             pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL),
@@ -779,18 +825,18 @@ class KVStore(MutableMapping[Any, Any]):
 
     @staticmethod
     def _decode_key(row: Mapping[str, Any]) -> Any:
-        key_format = row["key_format"]
-        if key_format == "int":
+        fmt = row["key_format"]
+        if fmt == "int":
             return int(row["key_int"])
-        if key_format == "float":
+        if fmt == "float":
             return float(row["key_real"])
-        if key_format == "str":
+        if fmt == "str":
             return row["key_text"]
-        if key_format == "bytes":
+        if fmt == "bytes":
             return bytes(row["key_blob"])
-        if key_format == "pickle":
+        if fmt == "pickle":
             return pickle.loads(row["key_payload"])
-        raise ValueError(f"unsupported key format {key_format!r}")
+        raise ValueError(f"unsupported key format {fmt!r}")
 
     # ------------------------------------------------------------------
     # Internal query helpers
@@ -802,24 +848,20 @@ class KVStore(MutableMapping[Any, Any]):
             [lookup_key],
         )
 
-    def _select_rows(
-        self,
-        *,
-        limit: int | None = None,
-        reverse: bool = False,
-    ) -> list[Mapping[str, Any]]:
+    def _select_rows(self, *, limit: int | None = None, reverse: bool = False) -> list[Mapping[str, Any]]:
+        now = self._now()
         if self._enforce and self._resolved_key_format is not None:
             column = self._sortable_column_for_format(self._resolved_key_format)
             order = f"ORDER BY {column} {'DESC' if reverse else 'ASC'}"
-            where = "WHERE key_format = ?"
-            params: list[Any] = [self._resolved_key_format]
+            where = "WHERE key_format = ? AND (expires_at IS NULL OR expires_at > ?)"
+            params: list[Any] = [self._resolved_key_format, now]
         else:
             order = f"ORDER BY lookup_key {'DESC' if reverse else 'ASC'}"
-            where = ""
-            params = []
+            where = "WHERE expires_at IS NULL OR expires_at > ?"
+            params = [now]
 
         limit_sql = f" LIMIT {limit}" if limit is not None else ""
-        sql = f"SELECT * FROM {self._table} {where} {order}{limit_sql}".strip()
+        sql = f"SELECT * FROM {self._table} {where} {order}{limit_sql}"
         return Database.fetchall(sql, params)
 
     def _ensure_range_key_type(self, key: Any) -> None:
@@ -855,9 +897,9 @@ class KVStore(MutableMapping[Any, Any]):
         """Async version of :meth:`get`."""
         return await asyncio.to_thread(self.get, key, default)
 
-    async def aset(self, key: Any, value: Any) -> None:
-        """Async ``__setitem__``."""
-        await asyncio.to_thread(self.__setitem__, key, value)
+    async def aset(self, key: Any, value: Any, *, ttl: float | int | None = None) -> None:
+        """Async ``__setitem__`` with optional TTL."""
+        await asyncio.to_thread(self.set, key, value, ttl=ttl)
 
     async def adelete(self, key: Any) -> None:
         """Async ``__delitem__``."""
@@ -877,7 +919,6 @@ class KVStore(MutableMapping[Any, Any]):
 
     async def aupdate(self, other: Mapping[Any, Any] | Iterable[tuple[Any, Any]] = (), /, **kwargs: Any) -> None:
         """Async version of :meth:`update`."""
-        # Collect into list first to avoid issues passing iterators across threads.
         pairs: list[tuple[Any, Any]] = []
         if isinstance(other, Mapping):
             pairs.extend(other.items())
@@ -908,9 +949,14 @@ class KVStore(MutableMapping[Any, Any]):
         """Async version of :meth:`get_many`."""
         return await asyncio.to_thread(lambda: self.get_many(*keys, **kwargs))
 
-    async def aset_many(self, items: Mapping[Any, Any] | Iterable[tuple[Any, Any]]) -> None:
+    async def aset_many(
+        self,
+        items: Mapping[Any, Any] | Iterable[tuple[Any, Any]],
+        *,
+        ttl: float | int | None = None,
+    ) -> None:
         """Async version of :meth:`set_many`."""
-        await asyncio.to_thread(self.set_many, items)
+        await asyncio.to_thread(self.set_many, items, ttl=ttl)
 
     async def adelete_many(self, keys: Sequence[Any] | Iterable[Any]) -> int:
         """Async version of :meth:`delete_many`."""
@@ -923,4 +969,3 @@ class KVStore(MutableMapping[Any, Any]):
     async def acontains(self, key: Any) -> bool:
         """Async version of :meth:`__contains__`."""
         return await asyncio.to_thread(self.__contains__, key)
-
