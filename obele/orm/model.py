@@ -14,12 +14,14 @@ Async methods are prefixed with ``a`` (e.g. ``acreate``, ``asave``)::
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Sequence
 from typing import Any, ClassVar
 
 from .database import Database
 from .fields import Field, IntegerField, ForeignKeyField, _MISSING
 from .query import QuerySet
 from .exceptions import RecordNotFoundError, FieldValidationError, MigrationError
+from .sql import validate_identifier
 
 # Global registry so ForeignKeyField can resolve string references lazily.
 _model_registry: dict[str, type[Model]] = {}
@@ -161,6 +163,7 @@ class MetaModel(type):
         # Default table_name = class name lower-cased (skip for base Model)
         if "table_name" not in namespace or not namespace.get("table_name"):
             namespace["table_name"] = cls_name.lower()
+        validate_identifier(namespace["table_name"], kind="table name")
 
         cls = super().__new__(mcs, cls_name, bases, namespace)
 
@@ -198,7 +201,7 @@ class MetaModel(type):
         """Pre-build INSERT and UPDATE SQL templates for this model."""
         non_pk = {n: f for n, f in cls._fields.items() if not f.primary_key}
         if not non_pk:
-            cls._insert_sql = ""
+            cls._insert_sql = f"INSERT INTO {cls.table_name} DEFAULT VALUES"
             cls._update_sql = ""
             cls._non_pk_field_names = ()
             return
@@ -293,7 +296,11 @@ class Model(metaclass=MetaModel):
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, type(self)):
             return NotImplemented
-        return self.__dict__.get(self._pk_name) == other.__dict__.get(other._pk_name)
+        pk = self.__dict__.get(self._pk_name)
+        other_pk = other.__dict__.get(other._pk_name)
+        if pk is None or other_pk is None:
+            return self is other
+        return pk == other_pk
 
     def __hash__(self) -> int:
         return hash((type(self).__name__, self.__dict__.get(self._pk_name)))
@@ -474,11 +481,28 @@ class Model(metaclass=MetaModel):
         await asyncio.to_thread(self.save)
 
     def _insert(self) -> None:
-        non_pk = self._non_pk_field_names
         fields = self._fields
-        values = [fields[n].to_db(self.__dict__.get(n)) for n in non_pk]
-        cursor = Database.execute(self._insert_sql, values)
-        self.__dict__[self._pk_name] = cursor.lastrowid
+        insert_names = [
+            name for name, field in fields.items()
+            if not (
+                field.primary_key
+                and self.__dict__.get(name) is None
+                and isinstance(field, IntegerField)
+            )
+        ]
+        if insert_names:
+            columns = [fields[n].column_name for n in insert_names]
+            placeholders = ", ".join("?" for _ in columns)
+            sql = (
+                f"INSERT INTO {self.table_name} ({', '.join(columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            values = [fields[n].to_db(self.__dict__.get(n)) for n in insert_names]
+            cursor = Database.execute(sql, values)
+        else:
+            cursor = Database.execute(f"INSERT INTO {self.table_name} DEFAULT VALUES")
+        if self.__dict__.get(self._pk_name) is None:
+            self.__dict__[self._pk_name] = cursor.lastrowid
         self._persisted = True
 
     def _update(self) -> None:
@@ -615,13 +639,14 @@ class Model(metaclass=MetaModel):
     @classmethod
     def get_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
         """Return ``(instance, created)`` - fetch if it exists, else create."""
-        try:
-            instance = cls.get(**kwargs)
-            return instance, False
-        except RecordNotFoundError:
-            if defaults:
-                kwargs.update(defaults)
-            return cls.create(**kwargs), True
+        with Database.transaction():
+            try:
+                instance = cls.get(**kwargs)
+                return instance, False
+            except RecordNotFoundError:
+                if defaults:
+                    kwargs.update(defaults)
+                return cls.create(**kwargs), True
 
     @classmethod
     async def aget_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
@@ -636,15 +661,139 @@ class Model(metaclass=MetaModel):
         row was inserted.
         """
         defaults = defaults or {}
+        with Database.transaction():
+            try:
+                instance = cls.get(**kwargs)
+                for key, val in defaults.items():
+                    setattr(instance, key, val)
+                instance.save()
+                return instance, False
+            except RecordNotFoundError:
+                kwargs.update(defaults)
+                return cls.create(**kwargs), True
+
+    @classmethod
+    def get_or_none(cls, **kwargs: Any) -> Model | None:
+        """Return one matching instance, or ``None`` when no row matches."""
         try:
-            instance = cls.get(**kwargs)
-            for key, val in defaults.items():
-                setattr(instance, key, val)
-            instance.save()
-            return instance, False
+            return cls.get(**kwargs)
         except RecordNotFoundError:
-            kwargs.update(defaults)
-            return cls.create(**kwargs), True
+            return None
+
+    @classmethod
+    async def aget_or_none(cls, **kwargs: Any) -> Model | None:
+        """Async version of :meth:`get_or_none`."""
+        return await asyncio.to_thread(cls.get_or_none, **kwargs)
+
+    @classmethod
+    def get_by_pk(cls, pk: Any) -> Model:
+        """Fetch one instance by primary key."""
+        return cls.get(**{cls._pk_name: pk})
+
+    @classmethod
+    async def aget_by_pk(cls, pk: Any) -> Model:
+        """Async version of :meth:`get_by_pk`."""
+        return await asyncio.to_thread(cls.get_by_pk, pk)
+
+    @classmethod
+    def upsert(
+        cls,
+        *,
+        conflict_fields: str | Sequence[str] | None = None,
+        update_fields: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> Model:
+        """Insert a row or update it on a SQLite conflict target.
+
+        ``conflict_fields`` defaults to the primary key when supplied, or the
+        first unique field present in ``kwargs``.
+        """
+        instance = cls(**kwargs)
+        for name, field in cls._fields.items():
+            field.validate(instance.__dict__.get(name))
+
+        if conflict_fields is None:
+            pk_value = instance.__dict__.get(cls._pk_name)
+            if pk_value is not None:
+                conflict_names = [cls._pk_name]
+            else:
+                conflict_names = [
+                    name for name, field in cls._fields.items()
+                    if field.unique and name in kwargs
+                ][:1]
+        elif isinstance(conflict_fields, str):
+            conflict_names = [conflict_fields]
+        else:
+            conflict_names = list(conflict_fields)
+        if not conflict_names:
+            raise ValueError("upsert() needs conflict_fields or a supplied primary/unique field")
+        for name in conflict_names:
+            if name not in cls._fields:
+                raise ValueError(f"Unknown conflict field {name!r}")
+
+        insert_names = [
+            name for name, field in cls._fields.items()
+            if name in kwargs
+            or field.default is not _MISSING
+            or not (
+                field.primary_key
+                and instance.__dict__.get(name) is None
+                and isinstance(field, IntegerField)
+            )
+        ]
+        columns = [cls._fields[n].column_name for n in insert_names]
+        values = [cls._fields[n].to_db(instance.__dict__.get(n)) for n in insert_names]
+        placeholders = ", ".join("?" for _ in columns)
+        conflict_cols = ", ".join(cls._fields[n].column_name for n in conflict_names)
+
+        if update_fields is None:
+            update_names = [
+                n for n in insert_names
+                if n not in conflict_names and not cls._fields[n].primary_key
+            ]
+        else:
+            update_names = list(update_fields)
+        for name in update_names:
+            if name not in cls._fields:
+                raise ValueError(f"Unknown update field {name!r}")
+
+        returning_cols = ", ".join(field.column_name for field in cls._fields.values())
+        if update_names:
+            set_sql = ", ".join(
+                f"{cls._fields[n].column_name} = excluded.{cls._fields[n].column_name}"
+                for n in update_names
+            )
+            conflict_sql = f"DO UPDATE SET {set_sql}"
+        else:
+            conflict_sql = "DO NOTHING"
+
+        sql = (
+            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) ON CONFLICT({conflict_cols}) "
+            f"{conflict_sql} RETURNING {returning_cols}"
+        )
+        with Database.transaction() as conn:
+            cursor = conn.execute(sql, values)
+            row = cursor.fetchone()
+        if row is not None:
+            return cls._from_row(dict(row))
+        return cls.get(**{name: instance.__dict__.get(name) for name in conflict_names})
+
+    @classmethod
+    async def aupsert(
+        cls,
+        *,
+        conflict_fields: str | Sequence[str] | None = None,
+        update_fields: Sequence[str] | None = None,
+        **kwargs: Any,
+    ) -> Model:
+        """Async version of :meth:`upsert`."""
+        return await asyncio.to_thread(
+            cls.upsert,
+            conflict_fields=conflict_fields,
+            update_fields=update_fields,
+            **kwargs,
+        )
 
     @classmethod
     async def aupdate_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
@@ -696,18 +845,12 @@ class Model(metaclass=MetaModel):
         )
 
         instances = []
-        conn = Database.get_connection()
-        with Database._write_lock:
-            try:
-                for row_params in params_seq:
-                    cursor = conn.execute(sql, row_params)
-                    row = cursor.fetchone()
-                    if row is not None:
-                        instances.append(cls._from_row(dict(row)))
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        with Database.transaction() as conn:
+            for row_params in params_seq:
+                cursor = conn.execute(sql, row_params)
+                row = cursor.fetchone()
+                if row is not None:
+                    instances.append(cls._from_row(dict(row)))
 
         return instances
 
@@ -739,29 +882,23 @@ class Model(metaclass=MetaModel):
         pk_col = cls._pk_field.column_name
 
         total = 0
-        conn = Database.get_connection()
-        with Database._write_lock:
-            try:
-                for instance in instances:
-                    pk_value = instance.__dict__.get(instance._pk_name)
-                    if pk_value is None:
-                        continue
-                    set_parts = []
-                    values = []
-                    for name in update_fields:
-                        f = cls._fields[name]
-                        set_parts.append(f"{f.column_name} = ?")
-                        values.append(f.to_db(instance.__dict__.get(name)))
-                    if not set_parts:
-                        continue
-                    values.append(pk_value)
-                    sql = f"UPDATE {cls.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
-                    cursor = conn.execute(sql, values)
-                    total += cursor.rowcount
-                conn.commit()
-            except Exception:
-                conn.rollback()
-                raise
+        with Database.transaction() as conn:
+            for instance in instances:
+                pk_value = instance.__dict__.get(instance._pk_name)
+                if pk_value is None:
+                    continue
+                set_parts = []
+                values = []
+                for name in update_fields:
+                    f = cls._fields[name]
+                    set_parts.append(f"{f.column_name} = ?")
+                    values.append(f.to_db(instance.__dict__.get(name)))
+                if not set_parts:
+                    continue
+                values.append(pk_value)
+                sql = f"UPDATE {cls.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
+                cursor = conn.execute(sql, values)
+                total += cursor.rowcount
 
         for instance in instances:
             instance._take_snapshot()

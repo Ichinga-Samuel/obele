@@ -54,6 +54,7 @@ class KV(KVStore):
         key_type: type[Any] | None = None,
         enforce_key_type: bool = True,
         serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
+        namespace: str | None = None,
     ) -> KV:
         # Fast path - no lock needed for reads.
         if cls._instance is not None:
@@ -75,6 +76,7 @@ class KV(KVStore):
         key_type: type[Any] | None = None,
         enforce_key_type: bool = True,
         serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
+        namespace: str | None = None,
     ) -> None:
         if getattr(self, "_kv_initialized", False):
             return
@@ -83,6 +85,7 @@ class KV(KVStore):
             key_type=key_type,
             enforce_key_type=enforce_key_type,
             serializer=serializer,
+            namespace=namespace,
         )
         self._kv_initialized = True
 
@@ -100,7 +103,7 @@ class KV(KVStore):
         if not getattr(self, "_kv_initialized", False):
             return "<KV (not initialised)>"
         return (
-            f"<KV table={self._table!r} size={len(self)} "
+            f"<KV table={self._table!r} namespace={self._namespace!r} size={len(self)} "
             f"key_type={self._resolved_key_type.__name__ if self._resolved_key_type else 'unset'} "
             f"enforce={self._enforce}>"
         )

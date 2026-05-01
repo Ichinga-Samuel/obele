@@ -7,16 +7,33 @@ validation, serialization, and column-level constraints.
 from __future__ import annotations
 
 import datetime
+import decimal
 import json
+import uuid
+from collections.abc import Callable, Sequence
 from typing import Any, TYPE_CHECKING
 
 from .exceptions import FieldValidationError
+from .sql import validate_identifier
 
 if TYPE_CHECKING:
     from .model import Model
 
 
 _MISSING = object()
+
+
+def _sql_literal(value: Any) -> str:
+    """Render a simple SQLite literal for DDL defaults."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, bool):
+        return "1" if value else "0"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, bytes):
+        return "X'" + value.hex() + "'"
+    return "'" + str(value).replace("'", "''") + "'"
 
 
 class Field:
@@ -30,7 +47,8 @@ class Field:
 
     __slots__ = (
         "primary_key", "nullable", "default", "db_default",
-        "unique", "index", "column_name", "attr_name", "_cached_ddl",
+        "unique", "index", "column_name", "attr_name", "validators",
+        "check", "_cached_ddl",
     )
 
     def __init__(
@@ -43,6 +61,8 @@ class Field:
         unique: bool = False,
         index: bool = False,
         column_name: str = "",
+        validators: Sequence[Callable[[Any], None]] | None = None,
+        check: str | None = None,
     ):
         self.primary_key = primary_key
         self.nullable = nullable
@@ -51,6 +71,8 @@ class Field:
         self.unique = unique
         self.index = index
         self.column_name = column_name
+        self.validators = tuple(validators or ())
+        self.check = check
         self.attr_name = ""
         self._cached_ddl: str | None = None
 
@@ -58,6 +80,7 @@ class Field:
         self.attr_name = name
         if not self.column_name:
             self.column_name = name
+        validate_identifier(self.column_name, kind="column name")
         self._cached_ddl = None  # Invalidate any prior cache
 
     def __get__(self, instance: Model | None, owner: type) -> Any:
@@ -106,6 +129,8 @@ class Field:
                 f"Expected {self.python_type.__name__} for field "
                 f"'{self.column_name}', got {type(value).__name__}"
             )
+        for validator in self.validators:
+            validator(value)
 
     def column_ddl(self) -> str:
         """Return the full column-definition fragment for CREATE TABLE."""
@@ -123,11 +148,9 @@ class Field:
         if self.db_default is not None:
             parts.append(f"DEFAULT {self.db_default}")
         elif self.default is not _MISSING and self.default is not None and not callable(self.default):
-            db_val = self.to_db(self.default)
-            if isinstance(db_val, str):
-                parts.append(f"DEFAULT '{db_val}'")
-            else:
-                parts.append(f"DEFAULT {db_val}")
+            parts.append(f"DEFAULT {_sql_literal(self.to_db(self.default))}")
+        if self.check is not None:
+            parts.append(f"CHECK ({self.check})")
         ddl = " ".join(parts)
         self._cached_ddl = ddl
         return ddl
@@ -169,10 +192,74 @@ class RealField(Field):
             return float(value)
         return super().to_python(value)
 
+    def validate(self, value: Any) -> None:
+        if value is None:
+            return super().validate(value)
+        if not isinstance(value, (int, float)):
+            raise FieldValidationError(
+                f"Expected float for field '{self.column_name}', got {type(value).__name__}"
+            )
+        for validator in self.validators:
+            validator(float(value))
+
 
 class BlobField(Field):
     sql_type = "BLOB"
     python_type = bytes
+
+
+class DecimalField(Field):
+    """Stored as TEXT, exposed as :class:`decimal.Decimal`."""
+
+    sql_type = "TEXT"
+    python_type = decimal.Decimal
+
+    def to_python(self, value: Any) -> decimal.Decimal:
+        if isinstance(value, decimal.Decimal):
+            return value
+        try:
+            return decimal.Decimal(str(value))
+        except decimal.InvalidOperation as exc:
+            raise FieldValidationError(
+                f"Cannot convert {value!r} to Decimal for field '{self.column_name}'"
+            ) from exc
+
+    def to_db(self, value: Any) -> str | None:
+        return None if value is None else str(self.to_python(value))
+
+    def validate(self, value: Any) -> None:
+        if value is None:
+            return super().validate(value)
+        converted = self.to_python(value)
+        for validator in self.validators:
+            validator(converted)
+
+
+class UUIDField(Field):
+    """Stored as TEXT, exposed as :class:`uuid.UUID`."""
+
+    sql_type = "TEXT"
+    python_type = uuid.UUID
+
+    def to_python(self, value: Any) -> uuid.UUID:
+        if isinstance(value, uuid.UUID):
+            return value
+        try:
+            return uuid.UUID(str(value))
+        except (TypeError, ValueError) as exc:
+            raise FieldValidationError(
+                f"Cannot convert {value!r} to UUID for field '{self.column_name}'"
+            ) from exc
+
+    def to_db(self, value: Any) -> str | None:
+        return None if value is None else str(self.to_python(value))
+
+    def validate(self, value: Any) -> None:
+        if value is None:
+            return super().validate(value)
+        converted = self.to_python(value)
+        for validator in self.validators:
+            validator(converted)
 
 
 class BooleanField(Field):

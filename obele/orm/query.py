@@ -18,6 +18,7 @@ from typing import Any, Iterator, AsyncIterator, TYPE_CHECKING
 from .database import Database
 from .exceptions import RecordNotFoundError, MultipleResultsError
 from .fields import ForeignKeyField
+from .sql import validate_identifier
 
 if TYPE_CHECKING:
     from .model import Model, ReverseRelationDescriptor
@@ -260,6 +261,7 @@ class QuerySet:
         self._group_by_fields: list[str] = []
         self._having_fragments: list[tuple[str, list[Any]]] = []
         self._values_fields: list[str] | None = None
+        self._values_mode: str | None = None
         self._values_flat: bool = False
         self._only_fields: list[str] | None = None
         self._defer_fields: list[str] | None = None
@@ -295,9 +297,13 @@ class QuerySet:
         qs._group_by_fields = list(self._group_by_fields)
         qs._having_fragments = list(self._having_fragments)
         qs._values_fields = list(self._values_fields) if self._values_fields is not None else None
+        qs._values_mode = self._values_mode
         qs._values_flat = self._values_flat
         qs._only_fields = list(self._only_fields) if self._only_fields is not None else None
         qs._defer_fields = list(self._defer_fields) if self._defer_fields is not None else None
+        if hasattr(self, "_raw_sql"):
+            qs._raw_sql = self._raw_sql
+            qs._raw_params = list(self._raw_params)
         return qs
 
     # ------------------------------------------------------------------
@@ -351,11 +357,15 @@ class QuerySet:
         return qs
 
     def limit(self, n: int) -> QuerySet:
+        if n < 0:
+            raise ValueError("limit() cannot be negative")
         qs = self._clone()
         qs._limit_val = n
         return qs
 
     def offset(self, n: int) -> QuerySet:
+        if n < 0:
+            raise ValueError("offset() cannot be negative")
         qs = self._clone()
         qs._offset_val = n
         return qs
@@ -374,6 +384,7 @@ class QuerySet:
         """Return dicts of specified fields instead of model instances."""
         qs = self._clone()
         qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
+        qs._values_mode = "dict"
         qs._values_flat = False
         return qs
 
@@ -383,6 +394,7 @@ class QuerySet:
             raise ValueError("flat=True requires exactly one field")
         qs = self._clone()
         qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
+        qs._values_mode = "tuple"
         qs._values_flat = flat
         return qs
 
@@ -438,6 +450,7 @@ class QuerySet:
         """
         qs = self._clone()
         for alias, expression in annotations.items():
+            validate_identifier(alias, kind="annotation alias")
             qs._annotations[alias] = qs._coerce_expression(expression)
         return qs
 
@@ -499,6 +512,7 @@ class QuerySet:
         qs._group_by_fields = []
         qs._having_fragments = []
         qs._values_fields = self._values_fields
+        qs._values_mode = self._values_mode
         qs._values_flat = self._values_flat
         qs._only_fields = None
         qs._defer_fields = None
@@ -538,7 +552,7 @@ class QuerySet:
                 elif name in self._annotations:
                     pass  # Will be added by annotation handling
                 else:
-                    cols.append(name)
+                    raise ValueError(f"Unknown field or annotation {name!r}")
             return cols
         return list(self._select_fields)
 
@@ -661,6 +675,16 @@ class QuerySet:
                 return row_dict.get(self.model_cls._fields[name].column_name)
             return row_dict.get(name)
 
+        if self._values_mode == "tuple":
+            values = []
+            for name in fields:
+                if name in self.model_cls._fields:
+                    col = self.model_cls._fields[name].column_name
+                    values.append(row_dict.get(col))
+                elif name in row_dict:
+                    values.append(row_dict[name])
+            return tuple(values)
+
         result = {}
         for name in fields:
             if name in self.model_cls._fields:
@@ -668,7 +692,7 @@ class QuerySet:
                 result[name] = row_dict.get(col)
             elif name in row_dict:
                 result[name] = row_dict[name]
-        return result if not self._values_flat else tuple(result.values())
+        return result
 
     # ------------------------------------------------------------------
     # Materialisation
@@ -764,6 +788,10 @@ class QuerySet:
 
     def update(self, *, validate: bool = True, **kwargs: Any) -> int:
         """Bulk UPDATE matching rows.  Returns number of rows affected."""
+        if not kwargs:
+            raise ValueError("update() requires at least one field")
+        if self._join_specs:
+            raise ValueError("update() does not support joined filters")
         set_parts: list[str] = []
         set_params: list[Any] = []
         for key, value in kwargs.items():
@@ -786,6 +814,8 @@ class QuerySet:
 
     def delete(self) -> int:
         """Bulk DELETE matching rows.  Returns number of rows affected."""
+        if self._join_specs:
+            raise ValueError("delete() does not support joined filters")
         sql = f"DELETE FROM {self.model_cls.table_name}"
         params: list[Any] = []
         if self._where_fragments:
@@ -867,6 +897,9 @@ class QuerySet:
         if lookup in _LIKE_PATTERNS:
             return self._compile_like(column_sql, lookup, value)
 
+        if value is None and lookup in {"exact", "ne"}:
+            return (f"{column_sql} IS {'NOT ' if lookup == 'ne' else ''}NULL", [])
+
         # Expression-based values
         if isinstance(value, QuerySet):
             value = Subquery(value)
@@ -889,6 +922,8 @@ class QuerySet:
         pattern_template, _ = _LIKE_PATTERNS[lookup]
         escaped = _escape_like(str(value))
         pattern = pattern_template.replace("{v}", escaped)
+        if lookup.startswith("i"):
+            return f"LOWER({column_sql}) LIKE ? ESCAPE '\\'", [pattern.lower()]
         return f"{column_sql} LIKE ? ESCAPE '\\'", [pattern]
 
     # ------------------------------------------------------------------
@@ -1001,6 +1036,8 @@ def _compile_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str
     if not isinstance(value, (list, tuple, set)):
         value = [value]
     values = list(value)
+    if not values:
+        return "0=1", []
     placeholders = ", ".join("?" for _ in values)
     params = [field_obj.to_db(v) if field_obj else v for v in values]
     return f"{col} IN ({placeholders})", params
@@ -1010,6 +1047,8 @@ def _compile_not_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple
     if not isinstance(value, (list, tuple, set)):
         value = [value]
     values = list(value)
+    if not values:
+        return "1=1", []
     placeholders = ", ".join("?" for _ in values)
     params = [field_obj.to_db(v) if field_obj else v for v in values]
     return f"{col} NOT IN ({placeholders})", params
