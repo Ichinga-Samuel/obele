@@ -8,10 +8,12 @@ through a single global lock.
 from __future__ import annotations
 
 import asyncio
+import logging
 import sqlite3
 import threading
+import time
 from contextvars import ContextVar, Token
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Sequence
 
 from .._identity import SCOPED_BINDING_CONTEXT, SAVEPOINT_PREFIX, default_database_path
@@ -125,12 +127,25 @@ class _DatabaseTransaction:
         self.__exit__(exc_type, exc_val, exc_tb)
 
 
+logger = logging.getLogger("obele")
+
+
 class Database:
     """Thread-safe SQLite connection manager with sync and async APIs.
 
     Uses per-thread connections for concurrent reads and a global write lock
     for serialized writes.  The configured database remains available globally,
     but callers can open a temporary scoped binding via :meth:`using`.
+
+    Configuration options::
+
+        Database.configure(
+            "app.db",
+            pragmas={"cache_size": -16000},
+            pool_size=10,            # max connections in the pool
+            log_queries=True,        # log all SQL to the 'obele' logger
+            slow_query_threshold=0.5, # log queries slower than 500ms as warnings
+        )
     """
 
     _lock: threading.RLock = threading.RLock()
@@ -141,6 +156,11 @@ class Database:
     _savepoint_counter: int = 0
     _connections: dict[int, sqlite3.Connection] = {}
     _connection_locks: dict[int, threading.RLock] = {}
+    _connection_created_at: dict[int, float] = {}
+    _pool_size: int = 0  # 0 = unlimited
+    _max_connection_age: float = 0.0  # seconds, 0 = no recycling
+    _log_queries: bool = False
+    _slow_query_threshold: float = 0.0  # seconds, 0 = disabled
     _scoped_binding: ContextVar[_ScopedBinding | None] = ContextVar(
         SCOPED_BINDING_CONTEXT, default=None,
     )
@@ -176,18 +196,45 @@ class Database:
     # ---- Configuration ----------------------------------------------------
 
     @classmethod
-    def configure(cls, db_path: str | None = None, pragmas: dict[str, Any] | None = None) -> None:
-        """Configure or reconfigure the global database connection."""
+    def configure(
+        cls,
+        db_path: str | None = None,
+        pragmas: dict[str, Any] | None = None,
+        *,
+        pool_size: int = 0,
+        max_connection_age: float = 0.0,
+        log_queries: bool = False,
+        slow_query_threshold: float = 0.0,
+    ) -> None:
+        """Configure or reconfigure the global database connection.
+
+        Args:
+            db_path: Path to the SQLite database file.
+            pragmas: Extra PRAGMA settings to apply on each connection.
+            pool_size: Max concurrent connections (0 = unlimited).
+            max_connection_age: Recycle connections older than this (seconds, 0 = never).
+            log_queries: Log every SQL statement to the ``obele`` logger.
+            slow_query_threshold: Warn on queries slower than this (seconds, 0 = off).
+        """
         resolved = db_path if db_path is not None else default_database_path()
         with cls._lock:
             cls.close_all()
             cls._db_path = resolved
             cls._pragmas = pragmas or {}
+            cls._pool_size = pool_size
+            cls._max_connection_age = max_connection_age
+            cls._log_queries = log_queries
+            cls._slow_query_threshold = slow_query_threshold
 
     @classmethod
-    async def aconfigure(cls, db_path: str | None = None, pragmas: dict[str, Any] | None = None) -> None:
+    async def aconfigure(
+        cls,
+        db_path: str | None = None,
+        pragmas: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Async version of :meth:`configure`."""
-        await asyncio.to_thread(cls.configure, db_path, pragmas)
+        await asyncio.to_thread(cls.configure, db_path, pragmas, **kwargs)
 
     @classmethod
     def using(cls, db_path: str | None = None, pragmas: dict[str, Any] | None = None) -> _DatabaseScope:
@@ -212,6 +259,15 @@ class Database:
 
     @classmethod
     def _create_connection(cls, db_path: str, pragmas: dict[str, Any]) -> sqlite3.Connection:
+        # Enforce pool size limit
+        if cls._pool_size > 0:
+            with cls._lock:
+                if len(cls._connections) >= cls._pool_size:
+                    raise DatabaseError(
+                        f"Connection pool exhausted (max {cls._pool_size}). "
+                        f"Close unused connections or increase pool_size."
+                    )
+
         try:
             conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         except sqlite3.Error as exc:
@@ -231,6 +287,7 @@ class Database:
         with cls._lock:
             cls._connections[id(conn)] = conn
             cls._connection_locks[id(conn)] = threading.RLock()
+            cls._connection_created_at[id(conn)] = time.monotonic()
         return conn
 
     @classmethod
@@ -245,6 +302,7 @@ class Database:
             with cls._lock:
                 cls._connections.pop(id(conn), None)
                 cls._connection_locks.pop(id(conn), None)
+                cls._connection_created_at.pop(id(conn), None)
 
     @classmethod
     def _operation_lock(cls, conn: sqlite3.Connection) -> threading.RLock:
@@ -277,6 +335,16 @@ class Database:
         await asyncio.to_thread(cls.close_all)
 
     @classmethod
+    def _should_recycle(cls, conn: sqlite3.Connection) -> bool:
+        """Return True if the connection has exceeded max_connection_age."""
+        if cls._max_connection_age <= 0:
+            return False
+        created_at = cls._connection_created_at.get(id(conn))
+        if created_at is None:
+            return False
+        return (time.monotonic() - created_at) > cls._max_connection_age
+
+    @classmethod
     def get_connection(cls) -> sqlite3.Connection:
         """Return the active connection, creating one per-thread if necessary."""
         transaction_connection = cls._transaction_connection.get()
@@ -285,11 +353,18 @@ class Database:
 
         binding = cls._scoped_binding.get()
         if binding is not None:
+            if binding.connection is not None and cls._should_recycle(binding.connection):
+                cls._close_connection(binding.connection)
+                binding.connection = None
             if binding.connection is None:
                 binding.connection = cls._create_connection(binding.db_path, binding.pragmas)
             return binding.connection
 
         conn = getattr(cls._local, "connection", None)
+        if conn is not None and cls._should_recycle(conn):
+            cls._close_connection(conn)
+            conn = None
+            cls._local.connection = None
         if conn is None:
             if not cls._db_path:
                 cls._db_path = default_database_path()
@@ -314,6 +389,19 @@ class Database:
         """Async version of :meth:`close`."""
         await asyncio.to_thread(cls.close)
 
+    # ---- Query logging ----------------------------------------------------
+
+    @classmethod
+    def _log_query(cls, sql: str, params: Sequence[Any] | None, elapsed: float) -> None:
+        """Log a query if logging is enabled."""
+        if cls._log_queries:
+            logger.debug("SQL [%.4fs]: %s | params=%r", elapsed, sql.strip(), params)
+        if cls._slow_query_threshold > 0 and elapsed > cls._slow_query_threshold:
+            logger.warning(
+                "SLOW QUERY [%.4fs > %.4fs]: %s | params=%r",
+                elapsed, cls._slow_query_threshold, sql.strip(), params,
+            )
+
     # ---- Write operations (serialized) ------------------------------------
 
     @classmethod
@@ -322,6 +410,7 @@ class Database:
         conn = cls.get_connection()
         in_managed_transaction = cls._transaction_connection.get() is conn
         lock = cls._operation_lock(conn) if in_managed_transaction else cls._write_lock
+        t0 = time.monotonic()
         with lock:
             own_transaction = not in_managed_transaction and not conn.in_transaction
             try:
@@ -333,6 +422,7 @@ class Database:
                     cursor = conn.execute(sql, params or ())
                 if own_transaction:
                     conn.commit()
+                cls._log_query(sql, params, time.monotonic() - t0)
                 return cursor
             except sqlite3.IntegrityError as exc:
                 if own_transaction:
@@ -378,11 +468,15 @@ class Database:
     def execute_read(cls, sql: str, params: Sequence[Any] | None = None) -> sqlite3.Cursor:
         """Execute a read-only query and return the cursor."""
         conn = cls.get_connection()
+        t0 = time.monotonic()
         try:
             if cls._transaction_connection.get() is conn:
                 with cls._operation_lock(conn):
-                    return conn.execute(sql, params or ())
-            return conn.execute(sql, params or ())
+                    cursor = conn.execute(sql, params or ())
+            else:
+                cursor = conn.execute(sql, params or ())
+            cls._log_query(sql, params, time.monotonic() - t0)
+            return cursor
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
 
@@ -479,3 +573,66 @@ class Database:
     async def aintegrity_check(cls) -> str:
         """Async version of :meth:`integrity_check`."""
         return await asyncio.to_thread(cls.integrity_check)
+
+    # ---- Backup -----------------------------------------------------------
+
+    @classmethod
+    def backup(
+        cls,
+        target_path: str,
+        *,
+        pages: int = -1,
+        progress: Any | None = None,
+    ) -> None:
+        """Create an online backup of the database to *target_path*.
+
+        Uses SQLite's ``connection.backup()`` API for a consistent,
+        lock-free copy::
+
+            Database.backup("backup.sqlite3")
+
+        Args:
+            target_path: File path for the backup database.
+            pages: Number of pages to copy at a time (-1 = all at once).
+            progress: Optional callback ``(status, remaining, total) -> None``.
+        """
+        source_conn = cls.get_connection()
+        target_conn = sqlite3.connect(target_path)
+        try:
+            source_conn.backup(target_conn, pages=pages, progress=progress)
+        except sqlite3.Error as exc:
+            raise DatabaseError(f"Backup failed: {exc}") from exc
+        finally:
+            target_conn.close()
+
+    @classmethod
+    async def abackup(
+        cls,
+        target_path: str,
+        *,
+        pages: int = -1,
+        progress: Any | None = None,
+    ) -> None:
+        """Async version of :meth:`backup`."""
+        await asyncio.to_thread(
+            cls.backup, target_path, pages=pages, progress=progress,
+        )
+
+    # ---- Pool info --------------------------------------------------------
+
+    @classmethod
+    def pool_status(cls) -> dict[str, Any]:
+        """Return connection pool statistics."""
+        with cls._lock:
+            active = len(cls._connections)
+            ages = {
+                cid: time.monotonic() - created
+                for cid, created in cls._connection_created_at.items()
+            }
+        return {
+            "active_connections": active,
+            "pool_size_limit": cls._pool_size or "unlimited",
+            "max_connection_age": cls._max_connection_age or "unlimited",
+            "connection_ages": ages,
+            "db_path": cls._db_path,
+        }

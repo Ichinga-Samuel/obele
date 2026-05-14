@@ -21,6 +21,7 @@ from .database import Database
 from .fields import Field, IntegerField, ForeignKeyField, _MISSING
 from .query import QuerySet
 from .exceptions import RecordNotFoundError, FieldValidationError, MigrationError
+from .signals import pre_save, post_save, pre_delete, post_delete, pre_create, post_create
 from .sql import validate_identifier
 
 # Global registry so ForeignKeyField can resolve string references lazily.
@@ -152,6 +153,14 @@ class MetaModel(type):
             if hasattr(base, "_fields"):
                 fields.update(base._fields)
 
+        # Collect fields from mixin bases (non-Model classes with Field attrs)
+        for base in bases:
+            if not hasattr(base, "_fields"):
+                for attr_name in dir(base):
+                    attr_val = getattr(base, attr_name, None)
+                    if isinstance(attr_val, Field):
+                        fields[attr_name] = attr_val
+
         # Collect fields defined in this class
         for attr_name, attr_val in list(namespace.items()):
             if isinstance(attr_val, Field):
@@ -188,6 +197,7 @@ class MetaModel(type):
         # Pre-compute SQL templates for INSERT/UPDATE
         if any(hasattr(b, "_fields") for b in bases):
             mcs._cache_sql_templates(cls)
+            mcs._collect_constraints(cls)
 
         # Register for FK lazy resolution + reverse relations
         if cls_name != "Model":
@@ -219,6 +229,13 @@ class MetaModel(type):
 
         cls._non_pk_field_names = tuple(non_pk.keys())
 
+    @staticmethod
+    def _collect_constraints(cls: type) -> None:
+        """Collect table-level constraint specs from the class definition."""
+        cls._unique_together = getattr(cls, 'unique_together', [])
+        cls._index_together = getattr(cls, 'index_together', [])
+        cls._check_constraints = getattr(cls, 'check_constraints', [])
+
 
 # ============================================================================
 # Model
@@ -241,6 +258,9 @@ class Model(metaclass=MetaModel):
     """
 
     table_name: ClassVar[str] = ""
+    unique_together: ClassVar[list[tuple[str, ...]]] = []
+    index_together: ClassVar[list[tuple[str, ...]]] = []
+    check_constraints: ClassVar[list[str]] = []
     _fields: ClassVar[dict[str, Field]]
     _pk_field: ClassVar[Field | None]
     _pk_name: ClassVar[str]
@@ -248,6 +268,9 @@ class Model(metaclass=MetaModel):
     _insert_sql: ClassVar[str]
     _update_sql: ClassVar[str]
     _non_pk_field_names: ClassVar[tuple[str, ...]]
+    _unique_together: ClassVar[list[tuple[str, ...]]]
+    _index_together: ClassVar[list[tuple[str, ...]]]
+    _check_constraints: ClassVar[list[str]]
 
     def __init__(self, **kwargs: Any) -> None:
         for name, field in self._fields.items():
@@ -312,18 +335,53 @@ class Model(metaclass=MetaModel):
         return [field.column_ddl() for field in cls._fields.values()]
 
     @classmethod
+    def _table_constraints_ddl(cls) -> list[str]:
+        """Return table-level constraint DDL fragments."""
+        constraints: list[str] = []
+        for fields in getattr(cls, '_unique_together', []):
+            cols = ", ".join(
+                cls._fields[f].column_name
+                for f in fields
+                if f in cls._fields
+            )
+            if cols:
+                constraints.append(f"UNIQUE ({cols})")
+        for expr in getattr(cls, '_check_constraints', []):
+            constraints.append(f"CHECK ({expr})")
+        return constraints
+
+    @classmethod
     def _create_table_sql(cls, if_not_exists: bool = True) -> str:
         maybe = "IF NOT EXISTS " if if_not_exists else ""
-        return f"CREATE TABLE {maybe}{cls.table_name} ({', '.join(cls._column_ddls())})"
+        parts = cls._column_ddls() + cls._table_constraints_ddl()
+        return f"CREATE TABLE {maybe}{cls.table_name} ({', '.join(parts)})"
 
     @classmethod
     def _create_index_sqls(cls) -> list[str]:
-        return [
+        indexes = [
             f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{f.column_name} "
             f"ON {cls.table_name} ({f.column_name})"
             for f in cls._fields.values()
             if f.index and not f.primary_key
         ]
+        # Compound indexes from index_together
+        for i, fields in enumerate(getattr(cls, '_index_together', [])):
+            cols = ", ".join(
+                cls._fields[f].column_name
+                for f in fields
+                if f in cls._fields
+            )
+            if cols:
+                suffix = "_".join(
+                    cls._fields[f].column_name
+                    for f in fields
+                    if f in cls._fields
+                )
+                indexes.append(
+                    f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{suffix} "
+                    f"ON {cls.table_name} ({cols})"
+                )
+        return indexes
 
     @classmethod
     def create_table(cls, if_not_exists: bool = True) -> None:
@@ -465,16 +523,24 @@ class Model(metaclass=MetaModel):
         """Insert or update this instance in the database.
 
         Uses dirty tracking: only changed fields are sent in UPDATE statements.
+        Emits ``pre_save`` / ``post_save`` signals.
         """
         pk_value = self.__dict__.get(self._pk_name)
         for name, field in self._fields.items():
             value = self.__dict__.get(name)
             field.validate(value)
+        created = not self._persisted or pk_value is None
+        pre_save.send(type(self), instance=self, created=created)
+        if created:
+            pre_create.send(type(self), instance=self)
         if self._persisted and pk_value is not None:
             self._update()
         else:
             self._insert()
         self._take_snapshot()
+        post_save.send(type(self), instance=self, created=created)
+        if created:
+            post_create.send(type(self), instance=self)
 
     async def asave(self) -> None:
         """Async version of :meth:`save`."""
@@ -525,10 +591,14 @@ class Model(metaclass=MetaModel):
         Database.execute(sql, values)
 
     def delete(self) -> None:
-        """Delete this instance from the database."""
+        """Delete this instance from the database.
+
+        Emits ``pre_delete`` / ``post_delete`` signals.
+        """
         pk_value = self.__dict__.get(self._pk_name)
         if pk_value is None:
             raise RecordNotFoundError("Cannot delete an unsaved instance")
+        pre_delete.send(type(self), instance=self)
         pk_col = type(self)._pk_field.column_name
         Database.execute(
             f"DELETE FROM {self.table_name} WHERE {pk_col} = ?",
@@ -536,6 +606,7 @@ class Model(metaclass=MetaModel):
         )
         self.__dict__[self._pk_name] = None
         self._persisted = False
+        post_delete.send(type(self), instance=self)
 
     async def adelete(self) -> None:
         """Async version of :meth:`delete`."""

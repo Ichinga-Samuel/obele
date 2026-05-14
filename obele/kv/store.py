@@ -1023,6 +1023,205 @@ class KVStore(MutableMapping[Any, Any]):
         raise ValueError("return_type must be 'dict' or 'tuple'")
 
     # ------------------------------------------------------------------
+    # Prefix and pattern queries
+    # ------------------------------------------------------------------
+
+    def prefix(
+        self,
+        prefix: str,
+        *,
+        limit: int | None = None,
+        reverse: bool = False,
+        return_type: MultiGetReturn = "dict",
+    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Return all entries whose string key starts with *prefix*.
+
+        Requires ``key_type=str`` (enforced or resolved)::
+
+            store["user:1"] = {"name": "Alice"}
+            store["user:2"] = {"name": "Bob"}
+            store["post:1"] = {"title": "Hello"}
+
+            store.prefix("user:")  # {"user:1": ..., "user:2": ...}
+
+        Args:
+            prefix: The string prefix to match.
+            limit: Maximum number of results.
+            reverse: If ``True``, return in reverse key order.
+            return_type: ``"dict"`` or ``"tuple"``.
+        """
+        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
+            raise TypeError("prefix() requires string keys")
+
+        now = self._now()
+        order = "DESC" if reverse else "ASC"
+
+        # Namespace-aware prefix scan on key_text column
+        sql = (
+            f"SELECT * FROM {self._table} "
+            f"WHERE namespace = ? AND key_format = 'str' "
+            f"AND key_text >= ? AND key_text < ? "
+            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"ORDER BY key_text {order}"
+        )
+        # Build the exclusive upper bound by incrementing the last character
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+        params: list[Any] = [self._namespace, prefix, upper, now]
+
+        if limit is not None:
+            sql += f" LIMIT {limit}"
+
+        rows = Database.fetchall(sql, params)
+        pairs = [
+            (self._strip_namespace(self._decode_key(row)),
+             self._decode_value(row["value_format"], row["value_payload"]))
+            for row in rows
+        ]
+        return self._format_pairs(pairs, return_type)
+
+    def scan(
+        self,
+        pattern: str = "*",
+        *,
+        limit: int | None = None,
+        return_type: MultiGetReturn = "dict",
+    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Return entries whose string key matches a SQL GLOB *pattern*.
+
+        Uses SQLite's ``GLOB`` operator for pattern matching::
+
+            store.scan("user:*")       # all keys starting with "user:"
+            store.scan("*:active")     # all keys ending with ":active"
+            store.scan("cache:[0-9]*") # cache keys starting with a digit
+
+        Args:
+            pattern: GLOB pattern (``*`` matches any chars, ``?`` one char).
+            limit: Maximum number of results.
+            return_type: ``"dict"`` or ``"tuple"``.
+        """
+        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
+            raise TypeError("scan() requires string keys")
+
+        now = self._now()
+        sql = (
+            f"SELECT * FROM {self._table} "
+            f"WHERE namespace = ? AND key_format = 'str' "
+            f"AND key_text GLOB ? "
+            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"ORDER BY key_text ASC"
+        )
+        params: list[Any] = [self._namespace, pattern, now]
+
+        if limit is not None:
+            sql += f" LIMIT {limit}"
+
+        rows = Database.fetchall(sql, params)
+        pairs = [
+            (self._strip_namespace(self._decode_key(row)),
+             self._decode_value(row["value_format"], row["value_payload"]))
+            for row in rows
+        ]
+        return self._format_pairs(pairs, return_type)
+
+    def prefix_keys(self, prefix: str, *, limit: int | None = None) -> list[str]:
+        """Return only the keys matching *prefix* (no values loaded)."""
+        now = self._now()
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+        sql = (
+            f"SELECT key_text FROM {self._table} "
+            f"WHERE namespace = ? AND key_format = 'str' "
+            f"AND key_text >= ? AND key_text < ? "
+            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"ORDER BY key_text ASC"
+        )
+        params: list[Any] = [self._namespace, prefix, upper, now]
+        if limit is not None:
+            sql += f" LIMIT {limit}"
+        rows = Database.fetchall(sql, params)
+        return [row["key_text"] for row in rows]
+
+    def prefix_count(self, prefix: str) -> int:
+        """Return count of keys matching *prefix*."""
+        now = self._now()
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+        count = Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE namespace = ? AND key_format = 'str' "
+            f"AND key_text >= ? AND key_text < ? "
+            f"AND (expires_at IS NULL OR expires_at > ?)",
+            [self._namespace, prefix, upper, now],
+            column="cnt",
+        )
+        return int(count or 0)
+
+    def prefix_delete(self, prefix: str) -> int:
+        """Delete all keys matching *prefix*. Returns number of rows removed."""
+        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+        cursor = Database.execute(
+            f"DELETE FROM {self._table} "
+            f"WHERE namespace = ? AND key_format = 'str' "
+            f"AND key_text >= ? AND key_text < ?",
+            [self._namespace, prefix, upper],
+        )
+        return cursor.rowcount
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        """Return store statistics for monitoring and debugging.
+
+        Returns a dict with::
+
+            {
+                "total_keys": 150,
+                "expired_keys": 3,
+                "key_format_counts": {"str": 140, "int": 10},
+                "namespace": "myapp",
+                "table": "kv_store",
+                "serializer": "auto",
+            }
+        """
+        now = self._now()
+
+        total = Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE namespace = ?",
+            [self._namespace],
+            column="cnt",
+        )
+
+        expired = Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            [self._namespace, now],
+            column="cnt",
+        )
+
+        format_rows = Database.fetchall(
+            f"SELECT key_format, COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE namespace = ? GROUP BY key_format",
+            [self._namespace],
+        )
+        format_counts = {row["key_format"]: row["cnt"] for row in format_rows}
+
+        return {
+            "total_keys": int(total or 0),
+            "expired_keys": int(expired or 0),
+            "active_keys": int(total or 0) - int(expired or 0),
+            "key_format_counts": format_counts,
+            "namespace": self._namespace,
+            "table": self._table,
+            "serializer": self._serializer_mode,
+            "key_type": self._resolved_key_type.__name__ if self._resolved_key_type else None,
+            "enforce_key_type": self._enforce,
+        }
+
+    async def astats(self) -> dict[str, Any]:
+        """Async version of :meth:`stats`."""
+        return await asyncio.to_thread(self.stats)
+
+    # ------------------------------------------------------------------
     # Async variants
     # ------------------------------------------------------------------
 
@@ -1163,3 +1362,40 @@ class KVStore(MutableMapping[Any, Any]):
             step=step,
             reverse=reverse,
         )
+
+    async def aprefix(
+        self,
+        prefix: str,
+        *,
+        limit: int | None = None,
+        reverse: bool = False,
+        return_type: MultiGetReturn = "dict",
+    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Async version of :meth:`prefix`."""
+        return await asyncio.to_thread(
+            self.prefix, prefix, limit=limit, reverse=reverse, return_type=return_type,
+        )
+
+    async def ascan(
+        self,
+        pattern: str = "*",
+        *,
+        limit: int | None = None,
+        return_type: MultiGetReturn = "dict",
+    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Async version of :meth:`scan`."""
+        return await asyncio.to_thread(
+            self.scan, pattern, limit=limit, return_type=return_type,
+        )
+
+    async def aprefix_keys(self, prefix: str, *, limit: int | None = None) -> list[str]:
+        """Async version of :meth:`prefix_keys`."""
+        return await asyncio.to_thread(self.prefix_keys, prefix, limit=limit)
+
+    async def aprefix_count(self, prefix: str) -> int:
+        """Async version of :meth:`prefix_count`."""
+        return await asyncio.to_thread(self.prefix_count, prefix)
+
+    async def aprefix_delete(self, prefix: str) -> int:
+        """Async version of :meth:`prefix_delete`."""
+        return await asyncio.to_thread(self.prefix_delete, prefix)

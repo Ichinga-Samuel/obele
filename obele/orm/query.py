@@ -265,6 +265,7 @@ class QuerySet:
         self._values_flat: bool = False
         self._only_fields: list[str] | None = None
         self._defer_fields: list[str] | None = None
+        self._prefetch_relations: list[str] = []
 
     def __iter__(self) -> Iterator[Model]:
         return self.iterator()
@@ -301,6 +302,7 @@ class QuerySet:
         qs._values_flat = self._values_flat
         qs._only_fields = list(self._only_fields) if self._only_fields is not None else None
         qs._defer_fields = list(self._defer_fields) if self._defer_fields is not None else None
+        qs._prefetch_relations = list(self._prefetch_relations)
         if hasattr(self, "_raw_sql"):
             qs._raw_sql = self._raw_sql
             qs._raw_params = list(self._raw_params)
@@ -437,6 +439,21 @@ class QuerySet:
                 qs._select_fields.append(
                     f"{join_spec.alias}.{field.column_name} AS {fk_name}__{field.column_name}"
                 )
+        return qs
+
+    def prefetch_related(self, *relations: str) -> QuerySet:
+        """Batch-load reverse FK relations in separate queries.
+
+        Unlike ``select_related`` (which uses JOINs), this issues a
+        separate query per relation, avoiding row duplication::
+
+            users = User.prefetch_related("post_set").all()
+            for user in users:
+                # user.post_set is pre-populated, no extra queries
+                print(user.post_set.all())
+        """
+        qs = self._clone()
+        qs._prefetch_relations = list(set(qs._prefetch_relations + list(relations)))
         return qs
 
     # ------------------------------------------------------------------
@@ -700,7 +717,10 @@ class QuerySet:
 
     def all(self) -> list:
         """Execute the query and return results."""
-        return list(self.iterator())
+        results = list(self.iterator())
+        if self._prefetch_relations:
+            self._do_prefetch(results)
+        return results
 
     def first(self) -> Any:
         """Return the first result or ``None``."""
@@ -781,6 +801,119 @@ class QuerySet:
         )
         agg_sql = f"SELECT {func}(__agg_target__) AS result FROM ({base_sql})"
         return Database.fetch_value(agg_sql, params, column="result")
+
+    # ------------------------------------------------------------------
+    # Pagination
+    # ------------------------------------------------------------------
+
+    def paginate(self, *, page: int = 1, per_page: int = 20) -> Any:
+        """Return an offset-based :class:`~obele.orm.pagination.Page`.
+
+        Args:
+            page: Page number (1-indexed).
+            per_page: Number of items per page.
+        """
+        from .pagination import paginate_queryset
+        return paginate_queryset(self, page=page, per_page=per_page)
+
+    async def apaginate(self, *, page: int = 1, per_page: int = 20) -> Any:
+        """Async version of :meth:`paginate`."""
+        from .pagination import apaginate_queryset
+        return await apaginate_queryset(self, page=page, per_page=per_page)
+
+    def cursor_paginate(
+        self,
+        *,
+        per_page: int = 20,
+        cursor_field: str = "",
+        after: Any = None,
+        before: Any = None,
+    ) -> Any:
+        """Return a cursor-based :class:`~obele.orm.pagination.CursorPage`.
+
+        The queryset should have an ``order_by`` applied.
+        """
+        from .pagination import cursor_paginate_queryset
+        return cursor_paginate_queryset(
+            self,
+            per_page=per_page,
+            cursor_field=cursor_field,
+            after=after,
+            before=before,
+        )
+
+    async def acursor_paginate(
+        self,
+        *,
+        per_page: int = 20,
+        cursor_field: str = "",
+        after: Any = None,
+        before: Any = None,
+    ) -> Any:
+        """Async version of :meth:`cursor_paginate`."""
+        from .pagination import acursor_paginate_queryset
+        return await acursor_paginate_queryset(
+            self,
+            per_page=per_page,
+            cursor_field=cursor_field,
+            after=after,
+            before=before,
+        )
+
+    # ------------------------------------------------------------------
+    # Prefetch support
+    # ------------------------------------------------------------------
+
+    def _do_prefetch(self, instances: list) -> None:
+        """Execute prefetch queries and attach results to instances."""
+        if not instances:
+            return
+
+        from .model import ReverseRelationDescriptor
+
+        for relation_name in self._prefetch_relations:
+            # Look up the reverse relation descriptor
+            reverse_relations: dict = getattr(
+                self.model_cls, "_reverse_relations", {},
+            )
+            descriptor = reverse_relations.get(relation_name)
+            if descriptor is None:
+                raise ValueError(
+                    f"'{relation_name}' is not a known reverse relation on "
+                    f"{self.model_cls.__name__}"
+                )
+
+            related_model = descriptor.related_model
+            fk_field_name = descriptor.field_name
+            fk_field = related_model._fields[fk_field_name]
+
+            # Collect all PKs
+            pk_values = [
+                inst.__dict__.get(inst._pk_name)
+                for inst in instances
+                if inst.__dict__.get(inst._pk_name) is not None
+            ]
+            if not pk_values:
+                continue
+
+            # Batch query: SELECT * FROM related WHERE fk_col IN (...)
+            related_items = related_model.filter(
+                **{f"{fk_field_name}__in": pk_values}
+            ).all()
+
+            # Group by FK value
+            grouped: dict[Any, list] = {}
+            for item in related_items:
+                fk_val = item.__dict__.get(fk_field_name)
+                grouped.setdefault(fk_val, []).append(item)
+
+            # Attach to instances via a prefetch cache
+            for inst in instances:
+                pk = inst.__dict__.get(inst._pk_name)
+                items = grouped.get(pk, [])
+                # Store as a prefetch cache attribute
+                cache_key = f"_prefetch_{relation_name}"
+                inst.__dict__[cache_key] = items
 
     # ------------------------------------------------------------------
     # Bulk write operations

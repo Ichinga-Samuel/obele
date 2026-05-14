@@ -8,7 +8,11 @@ from __future__ import annotations
 
 import datetime
 import decimal
+import enum
+import ipaddress
 import json
+import pickle
+import re
 import uuid
 from collections.abc import Callable, Sequence
 from typing import Any, TYPE_CHECKING
@@ -543,3 +547,226 @@ class ForeignKeyField(Field):
                 )
             return pk_value
         return super().to_db(value)
+
+
+class EnumField(Field):
+    """Stored as TEXT in SQLite, exposed as a Python :class:`~enum.Enum`.
+
+    Usage::
+
+        class Status(enum.Enum):
+            DRAFT = "draft"
+            PUBLISHED = "published"
+
+        class Post(Model):
+            status = EnumField(enum_class=Status, default=Status.DRAFT)
+    """
+
+    sql_type = "TEXT"
+    python_type = str  # Storage type
+
+    __slots__ = ("enum_class",)
+
+    def __init__(self, *, enum_class: type[enum.Enum], **kwargs: Any):
+        super().__init__(**kwargs)
+        self.enum_class = enum_class
+
+    def to_python(self, value: Any) -> enum.Enum:
+        if isinstance(value, self.enum_class):
+            return value
+        if isinstance(value, str):
+            try:
+                return self.enum_class(value)
+            except ValueError:
+                pass
+            # Try by name
+            try:
+                return self.enum_class[value]
+            except KeyError:
+                pass
+        raise FieldValidationError(
+            f"Cannot convert {value!r} to {self.enum_class.__name__} "
+            f"for field '{self.column_name}'"
+        )
+
+    def to_db(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, self.enum_class):
+            return value.value
+        return str(self.to_python(value).value)
+
+    def validate(self, value: Any) -> None:
+        if value is None:
+            if not self.nullable and not self.primary_key:
+                raise FieldValidationError(f"Field '{self.column_name}' does not allow None")
+            return
+        if not isinstance(value, self.enum_class):
+            try:
+                self.to_python(value)
+            except FieldValidationError:
+                raise
+        for validator in self.validators:
+            validator(value)
+
+    def __set__(self, instance: Any, value: Any) -> None:
+        if value is None:
+            if not self.nullable and not self.primary_key:
+                raise FieldValidationError(f"Field '{self.column_name}' does not allow None")
+            instance.__dict__[self.attr_name] = None
+            return
+        instance.__dict__[self.attr_name] = self.to_python(value)
+
+
+class TimeField(Field):
+    """Stored as ISO-8601 TEXT (time only) in SQLite, exposed as ``datetime.time``."""
+
+    sql_type = "TEXT"
+    python_type = datetime.time
+
+    def to_python(self, value: Any) -> datetime.time:
+        if isinstance(value, datetime.time):
+            return value
+        if isinstance(value, str):
+            return datetime.time.fromisoformat(value)
+        raise FieldValidationError(
+            f"Cannot convert {value!r} to time for field '{self.column_name}'"
+        )
+
+    def to_db(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        if isinstance(value, datetime.time):
+            return value.isoformat()
+        return str(value)
+
+
+_SLUG_RE = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+
+
+class SlugField(TextField):
+    """A :class:`TextField` that validates URL-safe slug format.
+
+    Slugs are lowercase alphanumeric strings separated by hyphens::
+
+        class Article(Model):
+            slug = SlugField(max_length=200, unique=True, index=True)
+    """
+
+    __slots__ = ()
+
+    def __init__(self, *, max_length: int = 255, **kwargs: Any):
+        super().__init__(max_length=max_length, **kwargs)
+
+    def validate(self, value: Any) -> None:
+        super().validate(value)
+        if value is not None and not _SLUG_RE.match(str(value)):
+            raise FieldValidationError(
+                f"Field '{self.column_name}' must be a valid slug "
+                f"(lowercase alphanumeric + hyphens), got {value!r}"
+            )
+
+
+_EMAIL_RE = re.compile(
+    r"^[a-zA-Z0-9.!#$%&'*+/=?^_`{|}~-]+@"
+    r"[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?"
+    r"(?:\.[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?)*$"
+)
+
+
+class EmailField(TextField):
+    """A :class:`TextField` that validates email address format::
+
+        class User(Model):
+            email = EmailField(unique=True, index=True)
+    """
+
+    __slots__ = ()
+
+    def __init__(self, *, max_length: int = 254, **kwargs: Any):
+        super().__init__(max_length=max_length, **kwargs)
+
+    def validate(self, value: Any) -> None:
+        super().validate(value)
+        if value is not None and not _EMAIL_RE.match(str(value)):
+            raise FieldValidationError(
+                f"Field '{self.column_name}' must be a valid email address, "
+                f"got {value!r}"
+            )
+
+
+class PickleField(Field):
+    """Stored as BLOB (pickled bytes), exposed as arbitrary Python objects.
+
+    Use for complex Python objects that don't have a natural SQL mapping::
+
+        class Task(Model):
+            metadata = PickleField(nullable=True)
+    """
+
+    sql_type = "BLOB"
+    python_type = object
+
+    def to_python(self, value: Any) -> Any:
+        if isinstance(value, (bytes, bytearray, memoryview)):
+            try:
+                return pickle.loads(bytes(value))
+            except (pickle.UnpicklingError, Exception) as exc:
+                raise FieldValidationError(
+                    f"Cannot unpickle value for field '{self.column_name}'"
+                ) from exc
+        return value
+
+    def to_db(self, value: Any) -> bytes | None:
+        if value is None:
+            return None
+        try:
+            return pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        except (pickle.PicklingError, TypeError) as exc:
+            raise FieldValidationError(
+                f"Cannot pickle value for field '{self.column_name}'"
+            ) from exc
+
+    def validate(self, value: Any) -> None:
+        if value is None:
+            if not self.nullable and not self.primary_key:
+                raise FieldValidationError(f"Field '{self.column_name}' does not allow None")
+            return
+        for validator in self.validators:
+            validator(value)
+
+
+class IPAddressField(Field):
+    """Stored as TEXT, exposed as :class:`~ipaddress.IPv4Address` or
+    :class:`~ipaddress.IPv6Address`::
+
+        class AccessLog(Model):
+            client_ip = IPAddressField()
+    """
+
+    sql_type = "TEXT"
+    python_type = object  # ipaddress.IPv4Address | ipaddress.IPv6Address
+
+    def to_python(self, value: Any) -> ipaddress.IPv4Address | ipaddress.IPv6Address:
+        if isinstance(value, (ipaddress.IPv4Address, ipaddress.IPv6Address)):
+            return value
+        try:
+            return ipaddress.ip_address(str(value))
+        except ValueError as exc:
+            raise FieldValidationError(
+                f"Cannot convert {value!r} to IP address for field '{self.column_name}'"
+            ) from exc
+
+    def to_db(self, value: Any) -> str | None:
+        if value is None:
+            return None
+        return str(self.to_python(value))
+
+    def validate(self, value: Any) -> None:
+        if value is None:
+            if not self.nullable and not self.primary_key:
+                raise FieldValidationError(f"Field '{self.column_name}' does not allow None")
+            return
+        self.to_python(value)
+        for validator in self.validators:
+            validator(value)
