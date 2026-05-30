@@ -168,8 +168,6 @@ class Database:
         f"{SCOPED_BINDING_CONTEXT}_transaction_connection", default=None,
     )
 
-    # ---- Context managers -------------------------------------------------
-
     def __enter__(self) -> Database:
         self.get_connection()
         return self
@@ -194,7 +192,6 @@ class Database:
         return f"<Database path={self._db_path!r}>"
 
     # ---- Configuration ----------------------------------------------------
-
     @classmethod
     def configure(
         cls,
@@ -256,7 +253,6 @@ class Database:
         return cls._db_path, dict(cls._pragmas)
 
     # ---- Connection management --------------------------------------------
-
     @classmethod
     def _create_connection(cls, db_path: str, pragmas: dict[str, Any]) -> sqlite3.Connection:
         # Enforce pool size limit
