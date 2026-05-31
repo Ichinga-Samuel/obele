@@ -20,33 +20,35 @@ from .._identity import SCOPED_BINDING_CONTEXT, SAVEPOINT_PREFIX, default_databa
 from .exceptions import DatabaseError, IntegrityError, ConfigurationError
 from .sql import validate_identifier
 
+logger = logging.getLogger("obele")
+
 
 @dataclass
-class _ScopedBinding:
+class ScopedBinding:
     db_path: str
     pragmas: dict[str, Any]
     connection: sqlite3.Connection | None = None
 
 
-class _DatabaseScope:
+class DatabaseScope:
     """Context manager for temporary scoped database bindings."""
 
-    __slots__ = ("_database_cls", "_binding", "_token")
+    __slots__ = ("database_cls", "binding", "token")
 
     def __init__(self, database_cls: type[Database], db_path: str, pragmas: dict[str, Any] | None = None) -> None:
-        self._database_cls = database_cls
-        self._binding = _ScopedBinding(db_path, pragmas or {})
-        self._token: Token[_ScopedBinding | None] | None = None
+        self.database_cls = database_cls
+        self.binding = ScopedBinding(db_path, pragmas or {})
+        self.token: Token[ScopedBinding | None] | None = None
 
     def __enter__(self) -> type[Database]:
-        self._token = self._database_cls._scoped_binding.set(self._binding)
-        return self._database_cls
+        self.token = self.database_cls.scoped_binding.set(self.binding)
+        return self.database_cls
 
     def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
-        self._database_cls._close_connection(self._binding.connection)
-        self._binding.connection = None
-        if self._token is not None:
-            self._database_cls._scoped_binding.reset(self._token)
+        self.database_cls.close_connection(self.binding.connection)
+        self.binding.connection = None
+        if self.token is not None:
+            self.database_cls.scoped_binding.reset(self.token)
 
     async def __aenter__(self) -> type[Database]:
         return self.__enter__()
@@ -55,70 +57,70 @@ class _DatabaseScope:
         self.__exit__(exc_type, exc_val, exc_tb)
 
 
-class _DatabaseTransaction:
+class DatabaseTransaction:
     """Context manager for explicit transactions with savepoint nesting."""
 
-    __slots__ = ("_database_cls", "_connection", "_savepoint_name", "_token", "_owns_lock")
+    __slots__ = ("database_cls", "connection", "savepoint_name", "token", "owns_lock")
+    connection: sqlite3.Connection
 
     def __init__(self, database_cls: type[Database]) -> None:
-        self._database_cls = database_cls
-        self._connection: sqlite3.Connection | None = None
-        self._savepoint_name: str | None = None
-        self._token: Token[sqlite3.Connection | None] | None = None
-        self._owns_lock = False
+        self.database_cls = database_cls
+        self.token: Token[sqlite3.Connection | None] | None = None
+        self.savepoint_name: str | None = None
+        self.owns_lock = False
 
     def __enter__(self) -> sqlite3.Connection:
-        db = self._database_cls
-        existing = db._transaction_connection.get()
+        db = self.database_cls
+        existing = db.transaction_connection.get()
         if existing is None:
             db._write_lock.acquire()
-            self._owns_lock = True
+            self.owns_lock = True
         try:
-            self._connection = existing or db.get_connection()
+            self.connection = existing or db.get_connection()
             if existing is None:
-                self._token = db._transaction_connection.set(self._connection)
-            if self._connection.in_transaction:
+                self.token = db.transaction_connection.set(self.connection)
+            if self.connection.in_transaction:
                 db._savepoint_counter += 1
-                self._savepoint_name = f"{SAVEPOINT_PREFIX}{db._savepoint_counter}"
-                self._connection.execute(f"SAVEPOINT {self._savepoint_name}")
+                self.savepoint_name = f"{SAVEPOINT_PREFIX}{db._savepoint_counter}"
+                self.connection.execute(f"SAVEPOINT {self.savepoint_name}")
             else:
-                self._connection.execute("BEGIN IMMEDIATE")
-            return self._connection
+                self.connection.execute("BEGIN IMMEDIATE")
+            return self.connection
         except sqlite3.Error as exc:
-            if self._token is not None:
-                db._transaction_connection.reset(self._token)
-                self._token = None
-            if self._owns_lock:
+            if self.token is not None:
+                db.transaction_connection.reset(self._token)
+                self.token = None
+            if self.owns_lock:
                 db._write_lock.release()
-                self._owns_lock = False
+                self.owns_lock = False
             raise DatabaseError(str(exc)) from exc
 
     def __exit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
-        assert self._connection is not None
+        assert self.connection is not None
         try:
-            sp = self._savepoint_name
+            sp = self.savepoint_name
             if exc_type is None:
                 if sp is not None:
-                    self._connection.execute(f"RELEASE SAVEPOINT {sp}")
+                    self.connection.execute(f"RELEASE SAVEPOINT {sp}")
                 else:
-                    self._connection.commit()
+                    self.connection.commit()
             else:
                 if sp is not None:
-                    self._connection.execute(f"ROLLBACK TO SAVEPOINT {sp}")
-                    self._connection.execute(f"RELEASE SAVEPOINT {sp}")
+                    self.connection.execute(f"ROLLBACK TO SAVEPOINT {sp}")
+                    self.connection.execute(f"RELEASE SAVEPOINT {sp}")
                 else:
-                    self._connection.rollback()
+                    self.connection.rollback()
         except sqlite3.IntegrityError as exc:
             raise IntegrityError(str(exc)) from exc
         except sqlite3.Error as exc:
             raise DatabaseError(str(exc)) from exc
         finally:
-            if self._token is not None:
-                self._database_cls._transaction_connection.reset(self._token)
-                self._token = None
-            if self._owns_lock:
-                self._database_cls._write_lock.release()
-                self._owns_lock = False
+            if self.token is not None:
+                self.database_cls.transaction_connection.reset(self.token)
+                self.token = None
+            if self.owns_lock:
+                self.database_cls._write_lock.release()
+                self.owns_lock = False
 
     async def __aenter__(self) -> sqlite3.Connection:
         return self.__enter__()
@@ -126,8 +128,23 @@ class _DatabaseTransaction:
     async def __aexit__(self, exc_type: type | None, exc_val: BaseException | None, exc_tb: Any) -> None:
         self.__exit__(exc_type, exc_val, exc_tb)
 
+@dataclass
+class Connection:
+    conn_id: int
+    connection: sqlite3.Connection
+    database: Database
+    read_lock: threading.RLock = None
+    write_lock: threading.RLock = None
+    created_at: float = field(default_factory=time.monotonic)
 
-logger = logging.getLogger("obele")
+    def close_connection(self) -> None:
+        try:
+            self.connection.close()
+        except sqlite3.Error:
+            pass
+        finally:
+            with self.read_lock:
+                self.database.connections.pop(self.conn_id)
 
 
 class Database:
@@ -147,13 +164,13 @@ class Database:
             slow_query_threshold=0.5, # log queries slower than 500ms as warnings
         )
     """
-
     _lock: threading.RLock = threading.RLock()
     _write_lock: threading.RLock = threading.RLock()
     _local: threading.local = threading.local()
     _db_path: str = ""
     _pragmas: dict[str, Any] = {}
     _savepoint_counter: int = 0
+    connections: dict[int, Connection]
     _connections: dict[int, sqlite3.Connection] = {}
     _connection_locks: dict[int, threading.RLock] = {}
     _connection_created_at: dict[int, float] = {}
@@ -161,12 +178,9 @@ class Database:
     _max_connection_age: float = 0.0  # seconds, 0 = no recycling
     _log_queries: bool = False
     _slow_query_threshold: float = 0.0  # seconds, 0 = disabled
-    _scoped_binding: ContextVar[_ScopedBinding | None] = ContextVar(
-        SCOPED_BINDING_CONTEXT, default=None,
-    )
-    _transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(
-        f"{SCOPED_BINDING_CONTEXT}_transaction_connection", default=None,
-    )
+    scoped_binding: ContextVar[ScopedBinding | None] = ContextVar(SCOPED_BINDING_CONTEXT, default=None)
+    transaction_connection: ContextVar[sqlite3.Connection | None] = ContextVar(f"{SCOPED_BINDING_CONTEXT}_transaction_connection",
+                                                                               default=None)
 
     def __enter__(self) -> Database:
         self.get_connection()
@@ -183,15 +197,13 @@ class Database:
         await self.aclose()
 
     def __repr__(self) -> str:
-        binding = self._scoped_binding.get()
-        if binding is not None:
-            return (
-                f"<Database path={binding.db_path!r} "
-                f"connected={binding.connection is not None} scoped=True>"
+        if (binding := self.scoped_binding.get()) is not None:
+            return (f"<Database path={binding.db_path!r} "
+                    f"connected={binding.connection is not None} scoped=True>"
             )
         return f"<Database path={self._db_path!r}>"
 
-    # ---- Configuration ----------------------------------------------------
+
     @classmethod
     def configure(
         cls,
@@ -234,36 +246,31 @@ class Database:
         await asyncio.to_thread(cls.configure, db_path, pragmas, **kwargs)
 
     @classmethod
-    def using(cls, db_path: str | None = None, pragmas: dict[str, Any] | None = None) -> _DatabaseScope:
+    def using(cls, db_path: str | None = None, pragmas: dict[str, Any] | None = None) -> DatabaseScope:
         """Return a sync/async context manager for a temporary scoped binding."""
         resolved = db_path if db_path is not None else default_database_path()
-        return _DatabaseScope(cls, resolved, pragmas)
+        return DatabaseScope(cls, resolved, pragmas)
 
     @classmethod
-    def transaction(cls) -> _DatabaseTransaction:
+    def transaction(cls) -> DatabaseTransaction:
         """Return a sync/async transaction context manager."""
-        return _DatabaseTransaction(cls)
+        return DatabaseTransaction(cls)
 
     @classmethod
     def current_config(cls) -> tuple[str, dict[str, Any]]:
         """Return the active database path and pragma configuration."""
-        binding = cls._scoped_binding.get()
-        if binding is not None:
+        if (binding := cls.scoped_binding.get()) is not None:
             return binding.db_path, dict(binding.pragmas)
         return cls._db_path, dict(cls._pragmas)
 
-    # ---- Connection management --------------------------------------------
     @classmethod
-    def _create_connection(cls, db_path: str, pragmas: dict[str, Any]) -> sqlite3.Connection:
+    def create_connection(cls, db_path: str, pragmas: dict[str, Any]) -> sqlite3.Connection:
         # Enforce pool size limit
         if cls._pool_size > 0:
             with cls._lock:
                 if len(cls._connections) >= cls._pool_size:
-                    raise DatabaseError(
-                        f"Connection pool exhausted (max {cls._pool_size}). "
-                        f"Close unused connections or increase pool_size."
-                    )
-
+                    error_msg = f"Connection pool exhausted (max {cls._pool_size}). Close unused connections or increase pool_size."
+                    raise DatabaseError(error_msg)
         try:
             conn = sqlite3.connect(db_path, check_same_thread=False, isolation_level=None)
         except sqlite3.Error as exc:
@@ -281,13 +288,14 @@ class Database:
         for pragma, value in pragmas.items():
             conn.execute(f"PRAGMA {pragma}={value}")
         with cls._lock:
+            cls.connections[id(conn)] = Connection(id(conn), conn, cls(), read_lock=cls._lock, write_lock=cls._write_lock)
             cls._connections[id(conn)] = conn
             cls._connection_locks[id(conn)] = threading.RLock()
             cls._connection_created_at[id(conn)] = time.monotonic()
         return conn
 
     @classmethod
-    def _close_connection(cls, conn: sqlite3.Connection | None) -> None:
+    def close_connection(cls, conn: sqlite3.Connection | None) -> None:
         if conn is None:
             return
         try:
@@ -459,7 +467,6 @@ class Database:
                 raise DatabaseError(str(exc)) from exc
 
     # ---- Read operations (concurrent, no global lock) ---------------------
-
     @classmethod
     def execute_read(cls, sql: str, params: Sequence[Any] | None = None) -> sqlite3.Cursor:
         """Execute a read-only query and return the cursor."""
