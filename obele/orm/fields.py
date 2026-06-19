@@ -45,29 +45,15 @@ class Field:
 
     Subclasses must set ``sql_type`` and ``python_type``.
     """
-
     sql_type: str = ""
     python_type: type = object
 
-    __slots__ = (
-        "primary_key", "nullable", "default", "db_default",
-        "unique", "index", "column_name", "attr_name", "validators",
-        "check", "_cached_ddl",
-    )
+    __slots__ = ("primary_key", "nullable", "default", "db_default", "unique", "index", "column_name", "attr_name", "validators",
+                 "check", "_cached_ddl",)
 
-    def __init__(
-        self,
-        *,
-        primary_key: bool = False,
-        nullable: bool = False,
-        default: Any = _MISSING,
-        db_default: str | None = None,
-        unique: bool = False,
-        index: bool = False,
-        column_name: str = "",
-        validators: Sequence[Callable[[Any], None]] | None = None,
-        check: str | None = None,
-    ):
+    def __init__(self, *, primary_key: bool = False, nullable: bool = False, default: Any = _MISSING, db_default: str | None = None,
+                 unique: bool = False, index: bool = False, column_name: str = "",
+                 validators: Sequence[Callable[[Any], None]] | None = None, check: str | None = None):
         self.primary_key = primary_key
         self.nullable = nullable
         self.default = default
@@ -90,10 +76,7 @@ class Field:
     def __get__(self, instance: Model | None, owner: type) -> Any:
         if instance is None:
             return self
-        return instance.__dict__.get(
-            self.attr_name,
-            self.default if self.default is not _MISSING else None,
-        )
+        return instance.__dict__.get(self.attr_name, self.default if self.default is not _MISSING else None)
 
     def __set__(self, instance: Model, value: Any) -> None:
         if value is None:
@@ -110,10 +93,8 @@ class Field:
         try:
             return self.python_type(value)
         except (TypeError, ValueError) as exc:
-            raise FieldValidationError(
-                f"Cannot convert {value!r} to {self.python_type.__name__} "
-                f"for field '{self.column_name}'"
-            ) from exc
+            raise FieldValidationError(f"Cannot convert {value!r} to {self.python_type.__name__} for field '{self.column_name}'") \
+                from exc
 
     def to_db(self, value: Any) -> Any:
         """Convert a Python value to something SQLite can store."""
@@ -291,6 +272,10 @@ class DateTimeField(Field):
     sql_type = "TEXT"
     python_type = datetime.datetime
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.default = datetime.datetime.now if self.default is _MISSING else self.default
+
     def to_python(self, value: Any) -> datetime.datetime:
         if isinstance(value, datetime.datetime):
             return value
@@ -441,14 +426,7 @@ class ForeignKeyField(Field):
 
     __slots__ = ("to", "on_delete", "related_name", "_related_model")
 
-    def __init__(
-        self,
-        *,
-        to: type[Model] | str,
-        on_delete: str = "CASCADE",
-        related_name: str | None = None,
-        **kwargs: Any,
-    ):
+    def __init__(self, *, to: type[Model] | str, on_delete: str = "CASCADE", related_name: str | None = None, **kwargs: Any):
         super().__init__(**kwargs)
         self.to = to  # resolved lazily if passed as string
         self.on_delete = on_delete.upper()

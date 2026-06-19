@@ -28,9 +28,6 @@ from .sql import validate_identifier
 _model_registry: dict[str, type[Model]] = {}
 
 
-# ============================================================================
-# Reverse relation support
-# ============================================================================
 
 class ReverseRelationManager:
     """Query helper for reverse foreign-key access.
@@ -46,9 +43,9 @@ class ReverseRelationManager:
     __slots__ = ("instance", "related_model", "field_name")
 
     def __init__(self, instance: Model, related_model: type[Model], field_name: str) -> None:
-        self.instance = instance
-        self.related_model = related_model
-        self.field_name = field_name
+        self.instance = instance # the instance here is of the parent model e.g. a user
+        self.related_model = related_model # related model is the child model e.g. the Post model
+        self.field_name = field_name # parent field name in related model e.g. author as a field in Post model referencing the User
 
     def __repr__(self) -> str:
         pk = self.instance.__dict__.get(self.instance._pk_name)
@@ -63,11 +60,8 @@ class ReverseRelationManager:
             raise RecordNotFoundError("Cannot use a reverse relation on an unsaved instance")
         return self.related_model.filter(**{self.field_name: pk})
 
-    # Delegate all QuerySet methods dynamically
     def __getattr__(self, name: str) -> Any:
-        qs = self._queryset()
-        attr = getattr(qs, name, None)
-        if attr is not None:
+        if (attr := getattr(self._queryset(), name, None)) is not None:
             return attr
         raise AttributeError(f"'{type(self).__name__}' has no attribute '{name}'")
 
@@ -138,30 +132,26 @@ def _register_reverse_relations() -> None:
             related_model._reverse_relations = reverse_relations
 
 
-# ============================================================================
-# MetaModel
-# ============================================================================
-
 class MetaModel(type):
     """Collect ``Field`` descriptors and configure the Model class."""
 
     def __new__(mcs, cls_name: str, bases: tuple[type, ...], namespace: dict[str, Any]) -> type:
         fields: dict[str, Field] = {}
 
-        # Inherit fields from parent models
+        # Get fields from parent models and non-Model classes with Field attrs
         for base in bases:
+            # Inherit fields from parent models
             if hasattr(base, "_fields"):
                 fields.update(base._fields)
 
-        # Collect fields from mixin bases (non-Model classes with Field attrs)
-        for base in bases:
-            if not hasattr(base, "_fields"):
+            # Collect fields from mixin bases (non-Model classes with Field attrs)
+            elif not hasattr(base, "_fields"):
                 for attr_name in dir(base):
-                    attr_val = getattr(base, attr_name, None)
-                    if isinstance(attr_val, Field):
+                    if isinstance(attr_val := getattr(base, attr_name, None), Field):
                         fields[attr_name] = attr_val
 
         # Collect fields defined in this class
+        # Add Field descriptors to the fields dict
         for attr_name, attr_val in list(namespace.items()):
             if isinstance(attr_val, Field):
                 fields[attr_name] = attr_val
@@ -179,7 +169,7 @@ class MetaModel(type):
         # Find primary key field
         pk_field = None
         for field in fields.values():
-            if field.primary_key:
+            if field.primary_key: # primary_key is a boolean attribute of Field
                 pk_field = field
                 break
 
@@ -200,6 +190,7 @@ class MetaModel(type):
             mcs._collect_constraints(cls)
 
         # Register for FK lazy resolution + reverse relations
+        # Model is the base class for all models
         if cls_name != "Model":
             _model_registry[cls_name] = cls
             _register_reverse_relations()
@@ -218,13 +209,11 @@ class MetaModel(type):
 
         columns = [f.column_name for f in non_pk.values()]
         placeholders = ", ".join("?" for _ in columns)
-        cls._insert_sql = (
-            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
-            f"VALUES ({placeholders})"
-        )
+        cls._insert_sql = f"INSERT INTO {cls.table_name} ({', '.join(columns)}) VALUES ({placeholders})"
 
         set_clause = ", ".join(f"{col} = ?" for col in columns)
-        pk_col = cls._pk_field.column_name if cls._pk_field else "id"
+        # pk_col = cls._pk_field.column_name if cls._pk_field else "id"
+        pk_col = cls._pk_name
         cls._update_sql = f"UPDATE {cls.table_name} SET {set_clause} WHERE {pk_col} = ?"
 
         cls._non_pk_field_names = tuple(non_pk.keys())
@@ -236,10 +225,6 @@ class MetaModel(type):
         cls._index_together = getattr(cls, 'index_together', [])
         cls._check_constraints = getattr(cls, 'check_constraints', [])
 
-
-# ============================================================================
-# Model
-# ============================================================================
 
 class Model(metaclass=MetaModel):
     """Base class for all ORM models.
@@ -256,7 +241,6 @@ class Model(metaclass=MetaModel):
         alice.name = "Alicia"
         alice.save()
     """
-
     table_name: ClassVar[str] = ""
     unique_together: ClassVar[list[tuple[str, ...]]] = []
     index_together: ClassVar[list[tuple[str, ...]]] = []
@@ -275,16 +259,16 @@ class Model(metaclass=MetaModel):
     def __init__(self, **kwargs: Any) -> None:
         for name, field in self._fields.items():
             if name in kwargs:
-                setattr(self, name, kwargs[name])
+                setattr(self, name, kwargs[name]) # The descriptor is called here
             elif field.default is not _MISSING:
-                default = field.default() if callable(field.default) else field.default
-                setattr(self, name, default)
+                setattr(self, name, field.default() if callable(field.default) else field.default)
             elif field.primary_key:
-                # PK is None until the row is inserted
+                # when PK is not provided it is None until the row is inserted
                 self.__dict__[name] = None
 
         self._persisted = kwargs.get("_persisted", False)
         self._annotations: dict[str, Any] = kwargs.get("_annotations", {})
+
         # Snapshot for dirty tracking
         self._snapshot: dict[str, Any] = {}
         if self._persisted:
@@ -292,9 +276,7 @@ class Model(metaclass=MetaModel):
 
     def _take_snapshot(self) -> None:
         """Snapshot current field values for dirty tracking."""
-        self._snapshot = {
-            name: self.__dict__.get(name) for name in self._non_pk_field_names
-        }
+        self._snapshot = {name: self.__dict__.get(name) for name in self._non_pk_field_names}
 
     @property
     def dirty_fields(self) -> dict[str, Any]:
@@ -313,8 +295,7 @@ class Model(metaclass=MetaModel):
         return bool(self.dirty_fields)
 
     def __repr__(self) -> str:
-        pk = self.__dict__.get(self._pk_name)
-        return f"<{type(self).__name__} pk={pk}>"
+        return f"<{type(self).__name__} pk={self.__dict__.get(self._pk_name)}>"
 
     def __eq__(self, other: object) -> bool:
         if not isinstance(other, type(self)):
@@ -322,13 +303,11 @@ class Model(metaclass=MetaModel):
         pk = self.__dict__.get(self._pk_name)
         other_pk = other.__dict__.get(other._pk_name)
         if pk is None or other_pk is None:
-            return self is other
+            return self is other # is this correct?
         return pk == other_pk
 
     def __hash__(self) -> int:
         return hash((type(self).__name__, self.__dict__.get(self._pk_name)))
-
-    # ---- Schema helpers ---------------------------------------------------
 
     @classmethod
     def _column_ddls(cls) -> list[str]:
@@ -336,14 +315,14 @@ class Model(metaclass=MetaModel):
 
     @classmethod
     def _table_constraints_ddl(cls) -> list[str]:
-        """Return table-level constraint DDL fragments."""
+        """Return table-level constraint DDL fragments.
+        "unique_together": a list of tuples
+        "check_constraints": a list of expressions
+
+        """
         constraints: list[str] = []
         for fields in getattr(cls, '_unique_together', []):
-            cols = ", ".join(
-                cls._fields[f].column_name
-                for f in fields
-                if f in cls._fields
-            )
+            cols = ", ".join(cls._fields[f].column_name for f in fields if f in cls._fields)
             if cols:
                 constraints.append(f"UNIQUE ({cols})")
         for expr in getattr(cls, '_check_constraints', []):
@@ -352,9 +331,9 @@ class Model(metaclass=MetaModel):
 
     @classmethod
     def _create_table_sql(cls, if_not_exists: bool = True) -> str:
-        maybe = "IF NOT EXISTS " if if_not_exists else ""
+        check = "IF NOT EXISTS " if if_not_exists else ""
         parts = cls._column_ddls() + cls._table_constraints_ddl()
-        return f"CREATE TABLE {maybe}{cls.table_name} ({', '.join(parts)})"
+        return f"CREATE TABLE {check}{cls.table_name} ({', '.join(parts)})"
 
     @classmethod
     def _create_index_sqls(cls) -> list[str]:
@@ -366,21 +345,10 @@ class Model(metaclass=MetaModel):
         ]
         # Compound indexes from index_together
         for i, fields in enumerate(getattr(cls, '_index_together', [])):
-            cols = ", ".join(
-                cls._fields[f].column_name
-                for f in fields
-                if f in cls._fields
-            )
+            cols = ", ".join(cls._fields[f].column_name for f in fields if f in cls._fields)
             if cols:
-                suffix = "_".join(
-                    cls._fields[f].column_name
-                    for f in fields
-                    if f in cls._fields
-                )
-                indexes.append(
-                    f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{suffix} "
-                    f"ON {cls.table_name} ({cols})"
-                )
+                suffix = "_".join(cls._fields[f].column_name for f in fields if f in cls._fields)
+                indexes.append(f"CREATE INDEX IF NOT EXISTS idx_{cls.table_name}_{suffix} ON {cls.table_name} ({cols})")
         return indexes
 
     @classmethod
@@ -398,8 +366,8 @@ class Model(metaclass=MetaModel):
     @classmethod
     def drop_table(cls, if_exists: bool = True) -> None:
         """Drop the SQLite table for this model."""
-        maybe = "IF EXISTS " if if_exists else ""
-        Database.execute(f"DROP TABLE {maybe}{cls.table_name}")
+        check = "IF EXISTS " if if_exists else ""
+        Database.execute(f"DROP TABLE {check}{cls.table_name}")
 
     @classmethod
     async def adrop_table(cls, if_exists: bool = True) -> None:
@@ -441,12 +409,7 @@ class Model(metaclass=MetaModel):
         )
 
     @classmethod
-    def migrate(
-        cls,
-        *,
-        rename_fields: dict[str, str] | None = None,
-        create_if_missing: bool = True,
-    ) -> None:
+    def migrate(cls, *, rename_fields: dict[str, str] | None = None, create_if_missing: bool = True,) -> None:
         """SQLite-only schema migration by safely rebuilding the table.
 
         Handles column additions, removals, and renames in a single
@@ -487,7 +450,8 @@ class Model(metaclass=MetaModel):
             select_expressions.append("?")
             params.append(default_value)
 
-        with Database.transaction() as conn:
+        with Database.transaction() as connection:
+            conn = connection.connection
             conn.execute(f"DROP TABLE IF EXISTS {temp_table}")
             conn.execute(f"ALTER TABLE {cls.table_name} RENAME TO {temp_table}")
             conn.execute(cls._create_table_sql(if_not_exists=False))
@@ -504,20 +468,13 @@ class Model(metaclass=MetaModel):
                 conn.execute(sql)
 
     @classmethod
-    async def amigrate(
-        cls,
-        *,
-        rename_fields: dict[str, str] | None = None,
-        create_if_missing: bool = True,
-    ) -> None:
+    async def amigrate(cls, *, rename_fields: dict[str, str] | None = None, create_if_missing: bool = True,) -> None:
         """Async version of :meth:`migrate`."""
         await asyncio.to_thread(
             cls.migrate,
             rename_fields=rename_fields,
             create_if_missing=create_if_missing,
         )
-
-    # ---- CRUD -------------------------------------------------------------
 
     def save(self) -> None:
         """Insert or update this instance in the database.
@@ -548,14 +505,8 @@ class Model(metaclass=MetaModel):
 
     def _insert(self) -> None:
         fields = self._fields
-        insert_names = [
-            name for name, field in fields.items()
-            if not (
-                field.primary_key
-                and self.__dict__.get(name) is None
-                and isinstance(field, IntegerField)
-            )
-        ]
+        insert_names = [name for name, field in fields.items()
+                        if not (field.primary_key and self.__dict__.get(name) is None and isinstance(field, IntegerField))]
         if insert_names:
             columns = [fields[n].column_name for n in insert_names]
             placeholders = ", ".join("?" for _ in columns)
@@ -600,10 +551,7 @@ class Model(metaclass=MetaModel):
             raise RecordNotFoundError("Cannot delete an unsaved instance")
         pre_delete.send(type(self), instance=self)
         pk_col = type(self)._pk_field.column_name
-        Database.execute(
-            f"DELETE FROM {self.table_name} WHERE {pk_col} = ?",
-            [pk_value],
-        )
+        Database.execute(f"DELETE FROM {self.table_name} WHERE {pk_col} = ?",[pk_value])
         self.__dict__[self._pk_name] = None
         self._persisted = False
         post_delete.send(type(self), instance=self)
@@ -618,14 +566,9 @@ class Model(metaclass=MetaModel):
         if pk_value is None:
             raise RecordNotFoundError("Cannot refresh an unsaved instance")
         pk_col = type(self)._pk_field.column_name
-        row = Database.fetchone(
-            f"SELECT * FROM {self.table_name} WHERE {pk_col} = ?",
-            [pk_value],
-        )
+        row = Database.fetchone(f"SELECT * FROM {self.table_name} WHERE {pk_col} = ?",[pk_value])
         if row is None:
-            raise RecordNotFoundError(
-                f"{type(self).__name__} with pk={pk_value} not found"
-            )
+            raise RecordNotFoundError(f"{type(self).__name__} with pk={pk_value} not found")
         row_dict = dict(row)
         for name, field in self._fields.items():
             if field.column_name in row_dict:
@@ -640,14 +583,7 @@ class Model(metaclass=MetaModel):
         """Async version of :meth:`refresh`."""
         await asyncio.to_thread(self.refresh)
 
-    # ---- Serialization ----------------------------------------------------
-
-    def to_dict(
-        self,
-        *,
-        mode: str = "python",
-        include_annotations: bool = True,
-    ) -> dict[str, Any]:
+    def to_dict(self, *, mode: str = "python", include_annotations: bool = True) -> dict[str, Any]:
         """Serialize all fields to a dictionary.
 
         Args:
@@ -658,10 +594,7 @@ class Model(metaclass=MetaModel):
         if mode == "python":
             data = {name: self.__dict__.get(name) for name in self._fields}
         elif mode == "db":
-            data = {
-                name: field.to_db(self.__dict__.get(name))
-                for name, field in self._fields.items()
-            }
+            data = {name: field.to_db(self.__dict__.get(name)) for name, field in self._fields.items()}
         else:
             raise ValueError("mode must be 'python' or 'db'")
 
@@ -673,8 +606,6 @@ class Model(metaclass=MetaModel):
         """Shorthand for ``to_dict(mode="db")``."""
         return self.to_dict(mode="db", include_annotations=include_annotations)
 
-    # ---- Construction from DB rows ----------------------------------------
-
     @classmethod
     def _from_row(cls, row_dict: dict[str, Any], *, annotations: dict[str, Any] | None = None) -> Model:
         """Construct a model instance from a database row dict."""
@@ -682,9 +613,7 @@ class Model(metaclass=MetaModel):
         d = instance.__dict__
         for name, field in cls._fields.items():
             col = field.column_name
-            if col in row_dict:
-                raw = row_dict[col]
-                d[name] = field.to_python(raw) if raw is not None else None
+            d[name] = field.to_python(row_dict[col]) if col in row_dict and row_dict[col] is not None else None
         d["_persisted"] = True
         ann = annotations or {}
         d["_annotations"] = ann
@@ -692,8 +621,6 @@ class Model(metaclass=MetaModel):
         for alias, value in ann.items():
             d[alias] = value
         return instance
-
-    # ---- Create / get_or_create / update_or_create ------------------------
 
     @classmethod
     def create(cls, **kwargs: Any) -> Model:
@@ -767,13 +694,8 @@ class Model(metaclass=MetaModel):
         return await asyncio.to_thread(cls.get_by_pk, pk)
 
     @classmethod
-    def upsert(
-        cls,
-        *,
-        conflict_fields: str | Sequence[str] | None = None,
-        update_fields: Sequence[str] | None = None,
-        **kwargs: Any,
-    ) -> Model:
+    def upsert(cls, *, conflict_fields: str | Sequence[str] | None = None, update_fields: Sequence[str] | None = None,
+               **kwargs: Any) -> Model:
         """Insert a row or update it on a SQLite conflict target.
 
         ``conflict_fields`` defaults to the primary key when supplied, or the
@@ -788,16 +710,14 @@ class Model(metaclass=MetaModel):
             if pk_value is not None:
                 conflict_names = [cls._pk_name]
             else:
-                conflict_names = [
-                    name for name, field in cls._fields.items()
-                    if field.unique and name in kwargs
-                ][:1]
+                conflict_names = [name for name, field in cls._fields.items() if field.unique and name in kwargs][:1]
         elif isinstance(conflict_fields, str):
             conflict_names = [conflict_fields]
         else:
             conflict_names = list(conflict_fields)
         if not conflict_names:
             raise ValueError("upsert() needs conflict_fields or a supplied primary/unique field")
+
         for name in conflict_names:
             if name not in cls._fields:
                 raise ValueError(f"Unknown conflict field {name!r}")
@@ -840,10 +760,11 @@ class Model(metaclass=MetaModel):
 
         sql = (
             f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
-            f"VALUES ({placeholders}) ON CONFLICT({conflict_cols}) "
+            f"VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) "
             f"{conflict_sql} RETURNING {returning_cols}"
         )
-        with Database.transaction() as conn:
+        with Database.transaction() as connection:
+            conn = connection.connection
             cursor = conn.execute(sql, values)
             row = cursor.fetchone()
         if row is not None:
@@ -871,8 +792,6 @@ class Model(metaclass=MetaModel):
         """Async version of :meth:`update_or_create`."""
         return await asyncio.to_thread(cls.update_or_create, defaults, **kwargs)
 
-    # ---- Bulk operations --------------------------------------------------
-
     @classmethod
     def bulk_create(cls, items: list[dict[str, Any]], *, validate: bool = True) -> list[Model]:
         """Insert many rows efficiently and return the instances.
@@ -882,25 +801,32 @@ class Model(metaclass=MetaModel):
         if not items:
             return []
 
-        non_pk = {n: f for n, f in cls._fields.items() if not f.primary_key}
-        columns = [f.column_name for f in non_pk.values()]
-        placeholders = ", ".join("?" for _ in columns)
-
         errors: list[str] = []
         params_seq = []
+        validation_error = False
         for idx, item in enumerate(items):
             row_values = []
-            for name, field in non_pk.items():
-                val = item.get(name)
-                if val is None and field.default is not _MISSING:
+            row_cols = []
+            for name, field in cls._fields.items():
+                val = item.get(name, _MISSING)
+                if val is _MISSING and field.default is not _MISSING:
                     val = field.default() if callable(field.default) else field.default
+
+                if val is _MISSING and field.default is _MISSING:
+                    continue
                 if validate:
                     try:
                         field.validate(val)
                     except FieldValidationError as exc:
                         errors.append(f"Item {idx}, field '{name}': {exc}")
+                        validation_error = True
+                        break
                 row_values.append(field.to_db(val))
-            params_seq.append(row_values)
+                row_cols.append(name)
+
+            if validation_error:
+                break
+            params_seq.append([row_values, row_cols, ", ".join("?" for _ in row_cols)])
 
         if errors:
             raise FieldValidationError(
@@ -908,21 +834,20 @@ class Model(metaclass=MetaModel):
                 + "\n".join(errors)
             )
 
-        # Use RETURNING for efficient row retrieval (SQLite 3.35+)
         returning_cols = ", ".join(f.column_name for f in cls._fields.values())
-        sql = (
-            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
-            f"VALUES ({placeholders}) RETURNING {returning_cols}"
-        )
 
         instances = []
-        with Database.transaction() as conn:
-            for row_params in params_seq:
-                cursor = conn.execute(sql, row_params)
+        with Database.transaction() as connection:
+            conn = connection.connection
+            for row in params_seq:
+                sql = (
+                    f"INSERT INTO {cls.table_name} ({', '.join(row[1])}) "
+                    f"VALUES ({row[2]}) RETURNING {returning_cols}"
+                )
+                cursor = conn.execute(sql, row[0])
                 row = cursor.fetchone()
                 if row is not None:
                     instances.append(cls._from_row(dict(row)))
-
         return instances
 
     @classmethod
@@ -931,11 +856,7 @@ class Model(metaclass=MetaModel):
         return await asyncio.to_thread(cls.bulk_create, items, validate=validate)
 
     @classmethod
-    def bulk_update(
-        cls,
-        instances: list[Model],
-        fields: list[str] | None = None,
-    ) -> int:
+    def bulk_update(cls, instances: list[Model], fields: list[str] | None = None,) -> int:
         """Bulk UPDATE a list of model instances.
 
         Args:
@@ -953,7 +874,8 @@ class Model(metaclass=MetaModel):
         pk_col = cls._pk_field.column_name
 
         total = 0
-        with Database.transaction() as conn:
+        with Database.transaction() as connection:
+            conn = connection.connection
             for instance in instances:
                 pk_value = instance.__dict__.get(instance._pk_name)
                 if pk_value is None:
@@ -980,8 +902,6 @@ class Model(metaclass=MetaModel):
         """Async version of :meth:`bulk_update`."""
         return await asyncio.to_thread(cls.bulk_update, instances, fields)
 
-    # ---- Raw SQL ----------------------------------------------------------
-
     @classmethod
     def raw(cls, sql: str, params: Any = None) -> list[Model]:
         """Execute raw SQL and return model instances.
@@ -995,8 +915,6 @@ class Model(metaclass=MetaModel):
     async def araw(cls, sql: str, params: Any = None) -> list[Model]:
         """Async version of :meth:`raw`."""
         return await asyncio.to_thread(cls.raw, sql, params)
-
-    # ---- QuerySet bridge ---------------------------------------------------
 
     @classmethod
     def _queryset(cls) -> QuerySet:
@@ -1026,6 +944,10 @@ class Model(metaclass=MetaModel):
     @classmethod
     def select_related(cls, *fk_fields: str) -> QuerySet:
         return cls._queryset().select_related(*fk_fields)
+
+    @classmethod
+    def prefetch_related(cls, *relations: str) -> QuerySet:
+        return cls._queryset().prefetch_related(*relations)
 
     @classmethod
     def join(cls, relation_name: str, *, join_type: str = "INNER") -> QuerySet:

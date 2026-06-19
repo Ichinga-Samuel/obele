@@ -64,10 +64,7 @@ class Page:
         return len(self.items)
 
     def __repr__(self) -> str:
-        return (
-            f"<Page {self.page}/{self.pages} "
-            f"items={len(self.items)} total={self.total}>"
-        )
+        return f"<Page {self.page}/{self.pages} items={len(self.items)} total={self.total}>"
 
 
 @dataclass(frozen=True, slots=True)
@@ -104,10 +101,7 @@ class CursorPage:
         return len(self.items)
 
     def __repr__(self) -> str:
-        return (
-            f"<CursorPage items={len(self.items)} "
-            f"has_next={self.has_next} has_prev={self.has_prev}>"
-        )
+        return f"<CursorPage items={len(self.items)} has_next={self.has_next} has_prev={self.has_prev}>"
 
 
 def paginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Page:
@@ -131,15 +125,7 @@ def paginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Pa
     offset = (page - 1) * per_page
     items = queryset.offset(offset).limit(per_page).all()
 
-    return Page(
-        items=items,
-        page=page,
-        per_page=per_page,
-        total=total,
-        pages=pages,
-        has_next=page < pages,
-        has_prev=page > 1,
-    )
+    return Page(items=items, page=page, per_page=per_page, total=total, pages=pages, has_next=page < pages, has_prev=page > 1)
 
 
 async def apaginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Page:
@@ -147,14 +133,8 @@ async def apaginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20
     return await asyncio.to_thread(paginate_queryset, queryset, page=page, per_page=per_page)
 
 
-def cursor_paginate_queryset(
-    queryset: Any,
-    *,
-    per_page: int = 20,
-    cursor_field: str = "",
-    after: Any = None,
-    before: Any = None,
-) -> CursorPage:
+def cursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
+                             before: Any = None,) -> CursorPage:
     """Execute cursor-based pagination on *queryset*.
 
     The queryset **must** have an ``order_by`` applied. The cursor field
@@ -175,40 +155,26 @@ def cursor_paginate_queryset(
 
     field = cursor_field or queryset.model_cls._pk_name
 
-    qs = queryset
     if after is not None:
-        qs = qs.filter(**{f"{field}__gt": after})
+        queryset = queryset.filter(**{f"{field}__gt": after})
     elif before is not None:
-        qs = qs.filter(**{f"{field}__lt": before})
+        queryset = queryset.filter(**{f"{field}__lt": before})
 
     # Fetch one extra to determine has_next
-    items = qs.limit(per_page + 1).all()
+    items = queryset.limit(per_page + 1).all()
     has_next = len(items) > per_page
     if has_next:
         items = items[:per_page]
 
     has_prev = after is not None or before is not None
-    start_cursor = getattr(items[0], field, None) if items else None
-    end_cursor = getattr(items[-1], field, None) if items else None
+    start = getattr(items[0], field, None) if items else None
+    end = getattr(items[-1], field, None) if items else None
 
-    return CursorPage(
-        items=items,
-        per_page=per_page,
-        has_next=has_next,
-        has_prev=has_prev,
-        start_cursor=start_cursor,
-        end_cursor=end_cursor,
-    )
+    return CursorPage(items=items, per_page=per_page, has_next=has_next, has_prev=has_prev, start_cursor=start, end_cursor=end,)
 
 
-async def acursor_paginate_queryset(
-    queryset: Any,
-    *,
-    per_page: int = 20,
-    cursor_field: str = "",
-    after: Any = None,
-    before: Any = None,
-) -> CursorPage:
+async def acursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
+                                    before: Any = None,) -> CursorPage:
     """Async version of :func:`cursor_paginate_queryset`."""
     return await asyncio.to_thread(
         cursor_paginate_queryset,

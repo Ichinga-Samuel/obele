@@ -533,6 +533,7 @@ class QuerySet:
         qs._values_flat = self._values_flat
         qs._only_fields = None
         qs._defer_fields = None
+        qs._prefetch_relations = []
         qs._raw_sql = combined_sql
         qs._raw_params = combined_params
         return qs
@@ -1019,7 +1020,12 @@ class QuerySet:
     def _compile_condition(self, key: str, value: Any) -> tuple[str, list[Any]]:
         """Compile a single lookup condition into SQL and params."""
         field_parts, lookup = self._split_lookup(key)
-        column_sql, field_obj = self._resolve_field_reference(field_parts)
+        # Check if this references an annotation alias first
+        if len(field_parts) == 1 and field_parts[0] in self._annotations:
+            column_sql = field_parts[0]
+            field_obj = None
+        else:
+            column_sql, field_obj = self._resolve_field_reference(field_parts)
 
         # Dispatch to specialized handlers
         handler = _LOOKUP_DISPATCH.get(lookup)

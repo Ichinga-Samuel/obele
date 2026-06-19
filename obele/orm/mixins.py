@@ -38,14 +38,8 @@ class TimestampMixin:
     on every save.
     """
 
-    created_at: ClassVar[DateTimeField] = DateTimeField(
-        nullable=True,
-        index=True,
-    )
-    updated_at: ClassVar[DateTimeField] = DateTimeField(
-        nullable=True,
-        index=True,
-    )
+    created_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True,)
+    updated_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True,)
 
     def save(self) -> None:
         """Override save to auto-set timestamps."""
@@ -68,13 +62,8 @@ class SoftDeleteMixin:
     removal.  Default queries exclude soft-deleted rows.
     """
 
-    is_deleted: ClassVar[BooleanField] = BooleanField(
-        default=False,
-        index=True,
-    )
-    deleted_at: ClassVar[DateTimeField] = DateTimeField(
-        nullable=True,
-    )
+    is_deleted: ClassVar[BooleanField] = BooleanField(default=False, index=True,)
+    deleted_at: ClassVar[DateTimeField] = DateTimeField(nullable=True,)
 
     def delete(self) -> None:
         """Soft-delete this instance (mark as deleted, keep the row)."""
