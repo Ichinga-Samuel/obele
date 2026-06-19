@@ -1,59 +1,67 @@
-name: Documentation
+name: GitHub Pages
 
 on:
   push:
     branches:
       - main
+      - dev3
   pull_request:
     branches:
       - main
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
   pages: write
   id-token: write
 
 concurrency:
-  group: "pages"
-  cancel-in-progress: false
+  group: pages-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build:
+    name: Build documentation
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install uv
-        uses: astral-sh/setup-uv@v5
-        with:
-          enable-cache: true
-      
+      - name: Checkout
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        run: uv python install 3.13
-        
-      - name: Install dependencies
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install documentation dependencies
         run: |
-          uv venv
-          uv pip install -e ".[docs]"
-        
-      - name: Build MkDocs
-        run: uv run mkdocs build --strict
-        
-      - name: Upload artifact
+          python -m pip install --upgrade pip
+          python -m pip install -e ".[docs]"
+
+      - name: Configure GitHub Pages
+        uses: actions/configure-pages@v5
+
+      - name: Build MkDocs site
+        run: mkdocs build --strict --site-dir site
+
+      - name: Upload GitHub Pages artifact
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
   deploy:
+    name: Deploy to GitHub Pages
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     needs: build
     runs-on: ubuntu-latest
+
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
+
     steps:
-      - name: Deploy to GitHub Pages
+      - name: Deploy
         id: deployment
         uses: actions/deploy-pages@v4

@@ -13,7 +13,6 @@ Async methods are prefixed with ``a`` (e.g. ``acreate``, ``asave``)::
 
 from __future__ import annotations
 
-import asyncio
 from collections.abc import Sequence
 from typing import Any, ClassVar
 
@@ -361,7 +360,11 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def acreate_table(cls, if_not_exists: bool = True) -> None:
         """Async version of :meth:`create_table`."""
-        await asyncio.to_thread(cls.create_table, if_not_exists)
+        cursor = await Database.aexecute(cls._create_table_sql(if_not_exists))
+        await cursor.close()
+        for sql in cls._create_index_sqls():
+            cursor = await Database.aexecute(sql)
+            await cursor.close()
 
     @classmethod
     def drop_table(cls, if_exists: bool = True) -> None:
@@ -372,7 +375,9 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def adrop_table(cls, if_exists: bool = True) -> None:
         """Async version of :meth:`drop_table`."""
-        await asyncio.to_thread(cls.drop_table, if_exists)
+        check = "IF EXISTS " if if_exists else ""
+        cursor = await Database.aexecute(f"DROP TABLE {check}{cls.table_name}")
+        await cursor.close()
 
     # ---- Migration --------------------------------------------------------
 
@@ -470,11 +475,62 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def amigrate(cls, *, rename_fields: dict[str, str] | None = None, create_if_missing: bool = True,) -> None:
         """Async version of :meth:`migrate`."""
-        await asyncio.to_thread(
-            cls.migrate,
-            rename_fields=rename_fields,
-            create_if_missing=create_if_missing,
+        row = await Database.afetchone(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            [cls.table_name],
         )
+        if row is None:
+            if create_if_missing:
+                await cls.acreate_table()
+                return
+            raise MigrationError(f"Table '{cls.table_name}' does not exist")
+
+        rename_fields = rename_fields or {}
+        pragma_rows = await Database.afetchall(f"PRAGMA table_info({cls.table_name})")
+        existing_columns = {r["name"] for r in pragma_rows}
+        temp_table = f"{cls.table_name}__old"
+
+        insert_columns: list[str] = []
+        select_expressions: list[str] = []
+        params: list[Any] = []
+
+        for field in cls._fields.values():
+            new_column = field.column_name
+            old_column = rename_fields.get(new_column, new_column)
+            if old_column in existing_columns:
+                insert_columns.append(new_column)
+                select_expressions.append(old_column)
+                continue
+
+            default_value = cls._migration_default_value(field)
+            if default_value is _MISSING:
+                continue
+
+            insert_columns.append(new_column)
+            select_expressions.append("?")
+            params.append(default_value)
+
+        async with Database.transaction():
+            cursor = await Database.aexecute(f"DROP TABLE IF EXISTS {temp_table}")
+            await cursor.close()
+            cursor = await Database.aexecute(f"ALTER TABLE {cls.table_name} RENAME TO {temp_table}")
+            await cursor.close()
+            cursor = await Database.aexecute(cls._create_table_sql(if_not_exists=False))
+            await cursor.close()
+
+            if insert_columns:
+                cursor = await Database.aexecute(
+                    f"INSERT INTO {cls.table_name} ({', '.join(insert_columns)}) "
+                    f"SELECT {', '.join(select_expressions)} FROM {temp_table}",
+                    params,
+                )
+                await cursor.close()
+
+            cursor = await Database.aexecute(f"DROP TABLE {temp_table}")
+            await cursor.close()
+            for sql in cls._create_index_sqls():
+                cursor = await Database.aexecute(sql)
+                await cursor.close()
 
     def save(self) -> None:
         """Insert or update this instance in the database.
@@ -501,7 +557,22 @@ class Model(metaclass=MetaModel):
 
     async def asave(self) -> None:
         """Async version of :meth:`save`."""
-        await asyncio.to_thread(self.save)
+        pk_value = self.__dict__.get(self._pk_name)
+        for name, field in self._fields.items():
+            value = self.__dict__.get(name)
+            field.validate(value)
+        created = not self._persisted or pk_value is None
+        pre_save.send(type(self), instance=self, created=created)
+        if created:
+            pre_create.send(type(self), instance=self)
+        if self._persisted and pk_value is not None:
+            await self._aupdate()
+        else:
+            await self._ainsert()
+        self._take_snapshot()
+        post_save.send(type(self), instance=self, created=created)
+        if created:
+            post_create.send(type(self), instance=self)
 
     def _insert(self) -> None:
         fields = self._fields
@@ -522,6 +593,28 @@ class Model(metaclass=MetaModel):
             self.__dict__[self._pk_name] = cursor.lastrowid
         self._persisted = True
 
+    async def _ainsert(self) -> None:
+        fields = self._fields
+        insert_names = [name for name, field in fields.items()
+                        if not (field.primary_key and self.__dict__.get(name) is None and isinstance(field, IntegerField))]
+        if insert_names:
+            columns = [fields[n].column_name for n in insert_names]
+            placeholders = ", ".join("?" for _ in columns)
+            sql = (
+                f"INSERT INTO {self.table_name} ({', '.join(columns)}) "
+                f"VALUES ({placeholders})"
+            )
+            values = [fields[n].to_db(self.__dict__.get(n)) for n in insert_names]
+            cursor = await Database.aexecute(sql, values)
+        else:
+            cursor = await Database.aexecute(f"INSERT INTO {self.table_name} DEFAULT VALUES")
+        try:
+            if self.__dict__.get(self._pk_name) is None:
+                self.__dict__[self._pk_name] = cursor.lastrowid
+            self._persisted = True
+        finally:
+            await cursor.close()
+
     def _update(self) -> None:
         dirty = self.dirty_fields
         if not dirty:
@@ -541,6 +634,26 @@ class Model(metaclass=MetaModel):
         sql = f"UPDATE {self.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
         Database.execute(sql, values)
 
+    async def _aupdate(self) -> None:
+        dirty = self.dirty_fields
+        if not dirty:
+            return
+
+        fields = self._fields
+        set_parts = []
+        values = []
+        for name, value in dirty.items():
+            f = fields[name]
+            set_parts.append(f"{f.column_name} = ?")
+            values.append(f.to_db(value))
+
+        pk_value = self.__dict__[self._pk_name]
+        values.append(pk_value)
+        pk_col = type(self)._pk_field.column_name
+        sql = f"UPDATE {self.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
+        cursor = await Database.aexecute(sql, values)
+        await cursor.close()
+
     def delete(self) -> None:
         """Delete this instance from the database.
 
@@ -558,7 +671,19 @@ class Model(metaclass=MetaModel):
 
     async def adelete(self) -> None:
         """Async version of :meth:`delete`."""
-        await asyncio.to_thread(self.delete)
+        pk_value = self.__dict__.get(self._pk_name)
+        if pk_value is None:
+            raise RecordNotFoundError("Cannot delete an unsaved instance")
+        pre_delete.send(type(self), instance=self)
+        pk_col = type(self)._pk_field.column_name
+        cursor = await Database.aexecute(
+            f"DELETE FROM {self.table_name} WHERE {pk_col} = ?",
+            [pk_value],
+        )
+        await cursor.close()
+        self.__dict__[self._pk_name] = None
+        self._persisted = False
+        post_delete.send(type(self), instance=self)
 
     def refresh(self) -> None:
         """Re-read this instance's data from the database."""
@@ -581,7 +706,24 @@ class Model(metaclass=MetaModel):
 
     async def arefresh(self) -> None:
         """Async version of :meth:`refresh`."""
-        await asyncio.to_thread(self.refresh)
+        pk_value = self.__dict__.get(self._pk_name)
+        if pk_value is None:
+            raise RecordNotFoundError("Cannot refresh an unsaved instance")
+        pk_col = type(self)._pk_field.column_name
+        row = await Database.afetchone(
+            f"SELECT * FROM {self.table_name} WHERE {pk_col} = ?",
+            [pk_value],
+        )
+        if row is None:
+            raise RecordNotFoundError(f"{type(self).__name__} with pk={pk_value} not found")
+        row_dict = dict(row)
+        for name, field in self._fields.items():
+            if field.column_name in row_dict:
+                raw = row_dict[field.column_name]
+                self.__dict__[name] = field.to_python(raw) if raw is not None else None
+                if isinstance(field, ForeignKeyField):
+                    self.__dict__.pop(field.cache_attr_name, None)
+        self._take_snapshot()
 
     def to_dict(self, *, mode: str = "python", include_annotations: bool = True) -> dict[str, Any]:
         """Serialize all fields to a dictionary.
@@ -632,7 +774,9 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def acreate(cls, **kwargs: Any) -> Model:
         """Async version of :meth:`create`."""
-        return await asyncio.to_thread(cls.create, **kwargs)
+        instance = cls(**kwargs)
+        await instance.asave()
+        return instance
 
     @classmethod
     def get_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
@@ -649,7 +793,14 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def aget_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
         """Async version of :meth:`get_or_create`."""
-        return await asyncio.to_thread(cls.get_or_create, defaults, **kwargs)
+        async with Database.transaction():
+            try:
+                instance = await cls.aget(**kwargs)
+                return instance, False
+            except RecordNotFoundError:
+                if defaults:
+                    kwargs.update(defaults)
+                return await cls.acreate(**kwargs), True
 
     @classmethod
     def update_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
@@ -681,7 +832,10 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def aget_or_none(cls, **kwargs: Any) -> Model | None:
         """Async version of :meth:`get_or_none`."""
-        return await asyncio.to_thread(cls.get_or_none, **kwargs)
+        try:
+            return await cls.aget(**kwargs)
+        except RecordNotFoundError:
+            return None
 
     @classmethod
     def get_by_pk(cls, pk: Any) -> Model:
@@ -691,7 +845,7 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def aget_by_pk(cls, pk: Any) -> Model:
         """Async version of :meth:`get_by_pk`."""
-        return await asyncio.to_thread(cls.get_by_pk, pk)
+        return await cls.aget(**{cls._pk_name: pk})
 
     @classmethod
     def upsert(cls, *, conflict_fields: str | Sequence[str] | None = None, update_fields: Sequence[str] | None = None,
@@ -780,17 +934,92 @@ class Model(metaclass=MetaModel):
         **kwargs: Any,
     ) -> Model:
         """Async version of :meth:`upsert`."""
-        return await asyncio.to_thread(
-            cls.upsert,
-            conflict_fields=conflict_fields,
-            update_fields=update_fields,
-            **kwargs,
+        instance = cls(**kwargs)
+        for name, field in cls._fields.items():
+            field.validate(instance.__dict__.get(name))
+
+        if conflict_fields is None:
+            pk_value = instance.__dict__.get(cls._pk_name)
+            if pk_value is not None:
+                conflict_names = [cls._pk_name]
+            else:
+                conflict_names = [name for name, field in cls._fields.items() if field.unique and name in kwargs][:1]
+        elif isinstance(conflict_fields, str):
+            conflict_names = [conflict_fields]
+        else:
+            conflict_names = list(conflict_fields)
+        if not conflict_names:
+            raise ValueError("upsert() needs conflict_fields or a supplied primary/unique field")
+
+        for name in conflict_names:
+            if name not in cls._fields:
+                raise ValueError(f"Unknown conflict field {name!r}")
+
+        insert_names = [
+            name for name, field in cls._fields.items()
+            if name in kwargs
+            or field.default is not _MISSING
+            or not (
+                field.primary_key
+                and instance.__dict__.get(name) is None
+                and isinstance(field, IntegerField)
+            )
+        ]
+        columns = [cls._fields[n].column_name for n in insert_names]
+        values = [cls._fields[n].to_db(instance.__dict__.get(n)) for n in insert_names]
+        placeholders = ", ".join("?" for _ in columns)
+        conflict_cols = ", ".join(cls._fields[n].column_name for n in conflict_names)
+
+        if update_fields is None:
+            update_names = [
+                n for n in insert_names
+                if n not in conflict_names and not cls._fields[n].primary_key
+            ]
+        else:
+            update_names = list(update_fields)
+        for name in update_names:
+            if name not in cls._fields:
+                raise ValueError(f"Unknown update field {name!r}")
+
+        returning_cols = ", ".join(field.column_name for field in cls._fields.values())
+        if update_names:
+            set_sql = ", ".join(
+                f"{cls._fields[n].column_name} = excluded.{cls._fields[n].column_name}"
+                for n in update_names
+            )
+            conflict_sql = f"DO UPDATE SET {set_sql}"
+        else:
+            conflict_sql = "DO NOTHING"
+
+        sql = (
+            f"INSERT INTO {cls.table_name} ({', '.join(columns)}) "
+            f"VALUES ({placeholders}) ON CONFLICT ({conflict_cols}) "
+            f"{conflict_sql} RETURNING {returning_cols}"
         )
+        async with Database.transaction():
+            cursor = await Database.aexecute(sql, values)
+            try:
+                row = await cursor.fetchone()
+            finally:
+                await cursor.close()
+        if row is not None:
+            return cls._from_row(dict(row))
+        return await cls.aget(**{name: instance.__dict__.get(name) for name in conflict_names})
 
     @classmethod
     async def aupdate_or_create(cls, defaults: dict[str, Any] | None = None, **kwargs: Any) -> tuple[Model, bool]:
         """Async version of :meth:`update_or_create`."""
-        return await asyncio.to_thread(cls.update_or_create, defaults, **kwargs)
+        defaults = defaults or {}
+        async with Database.transaction():
+            try:
+                instance = await cls.aget(**kwargs)
+                for key, val in defaults.items():
+                    setattr(instance, key, val)
+                await instance.asave()
+                return instance, False
+            except RecordNotFoundError:
+                kwargs.update(defaults)
+                return await cls.acreate(**kwargs), True
 
     @classmethod
     def bulk_create(cls, items: list[dict[str, Any]], *, validate: bool = True) -> list[Model]:
@@ -853,7 +1082,59 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def abulk_create(cls, items: list[dict[str, Any]], *, validate: bool = True) -> list[Model]:
         """Async version of :meth:`bulk_create`."""
-        return await asyncio.to_thread(cls.bulk_create, items, validate=validate)
+        if not items:
+            return []
+
+        errors: list[str] = []
+        params_seq = []
+        validation_error = False
+        for idx, item in enumerate(items):
+            row_values = []
+            row_cols = []
+            for name, field in cls._fields.items():
+                val = item.get(name, _MISSING)
+                if val is _MISSING and field.default is not _MISSING:
+                    val = field.default() if callable(field.default) else field.default
+
+                if val is _MISSING and field.default is _MISSING:
+                    continue
+                if validate:
+                    try:
+                        field.validate(val)
+                    except FieldValidationError as exc:
+                        errors.append(f"Item {idx}, field '{name}': {exc}")
+                        validation_error = True
+                        break
+                row_values.append(field.to_db(val))
+                row_cols.append(name)
+
+            if validation_error:
+                break
+            params_seq.append([row_values, row_cols, ", ".join("?" for _ in row_cols)])
+
+        if errors:
+            raise FieldValidationError(
+                f"Validation failed for {len(errors)} field(s) in bulk_create:\n"
+                + "\n".join(errors)
+            )
+
+        returning_cols = ", ".join(f.column_name for f in cls._fields.values())
+
+        instances = []
+        async with Database.transaction():
+            for row in params_seq:
+                sql = (
+                    f"INSERT INTO {cls.table_name} ({', '.join(row[1])}) "
+                    f"VALUES ({row[2]}) RETURNING {returning_cols}"
+                )
+                cursor = await Database.aexecute(sql, row[0])
+                try:
+                    db_row = await cursor.fetchone()
+                finally:
+                    await cursor.close()
+                if db_row is not None:
+                    instances.append(cls._from_row(dict(db_row)))
+        return instances
 
     @classmethod
     def bulk_update(cls, instances: list[Model], fields: list[str] | None = None,) -> int:
@@ -900,7 +1181,37 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def abulk_update(cls, instances: list[Model], fields: list[str] | None = None) -> int:
         """Async version of :meth:`bulk_update`."""
-        return await asyncio.to_thread(cls.bulk_update, instances, fields)
+        if not instances:
+            return 0
+
+        update_fields = fields or list(cls._non_pk_field_names)
+        pk_col = cls._pk_field.column_name
+
+        total = 0
+        async with Database.transaction():
+            for instance in instances:
+                pk_value = instance.__dict__.get(instance._pk_name)
+                if pk_value is None:
+                    continue
+                set_parts = []
+                values = []
+                for name in update_fields:
+                    f = cls._fields[name]
+                    set_parts.append(f"{f.column_name} = ?")
+                    values.append(f.to_db(instance.__dict__.get(name)))
+                if not set_parts:
+                    continue
+                values.append(pk_value)
+                sql = f"UPDATE {cls.table_name} SET {', '.join(set_parts)} WHERE {pk_col} = ?"
+                cursor = await Database.aexecute(sql, values)
+                try:
+                    total += cursor.rowcount
+                finally:
+                    await cursor.close()
+
+        for instance in instances:
+            instance._take_snapshot()
+        return total
 
     @classmethod
     def raw(cls, sql: str, params: Any = None) -> list[Model]:
@@ -914,7 +1225,8 @@ class Model(metaclass=MetaModel):
     @classmethod
     async def araw(cls, sql: str, params: Any = None) -> list[Model]:
         """Async version of :meth:`raw`."""
-        return await asyncio.to_thread(cls.raw, sql, params)
+        rows = await Database.afetchall(sql, params)
+        return [cls._from_row(dict(r)) for r in rows]
 
     @classmethod
     def _queryset(cls) -> QuerySet:

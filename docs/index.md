@@ -1,12 +1,20 @@
 # Obele
 
-A lightweight, async-ready ORM for SQLite, built for modern Python applications. 
-Obele provides an intuitive, Django-like API while maintaining the simplicity and embedded nature of SQLite.
+Obele is a lightweight SQLite ORM and key-value store for modern Python
+applications. It provides a small, Django-like model and query API, plus native
+asyncio support through the bundled `obele.asqlite` bridge.
 
-## Installation
+## Install
 
 ```bash
 pip install obele
+```
+
+For development:
+
+```bash
+python -m pip install -e ".[dev]"
+pytest -q
 ```
 
 ## Quickstart
@@ -15,45 +23,49 @@ pip install obele
 import asyncio
 from obele import Database, Model, TextField, IntegerField
 
-# 1. Configure the database
-Database.configure("my_app.db")
+Database.configure("my_app.sqlite3")
 
-# 2. Define a model
 class User(Model):
+    table_name = "users"
     name = TextField()
     age = IntegerField(nullable=True)
 
 async def main():
-    # 3. Create the table
     await User.acreate_table()
-
-    # 4. Insert records
     await User.acreate(name="Alice", age=30)
     await User.acreate(name="Bob", age=25)
 
-    # 5. Query records
     adults = await User.filter(age__gte=18).order_by("name").aall()
     for user in adults:
-        print(f"{user.name} is {user.age} years old.")
+        print(f"{user.name} is {user.age} years old")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+    await Database.aclose_all()
+
+asyncio.run(main())
 ```
-*(Note: Obele provides both sync and async APIs. You can omit the `a` prefix for synchronous usage: `User.create_table()`, `User.create()`, `User.filter().all()`)*
 
-## Key Features
+Synchronous code uses the same methods without the `a` prefix:
 
-- **Sync and Async**: First-class support for both synchronous and asynchronous (asyncio) workflows.
-- **Django-like API**: Familiar `Model`, `Field`, and `QuerySet` semantics.
-- **Advanced Field Types**: Support for UUIDs, JSON, Enums, Timestamps, and more.
-- **Relations**: Foreign keys and reverse relations out of the box.
-- **Mixins**: Built-in support for Soft Deletion and Timestamping.
-- **Signals**: Hook into pre/post save, create, and delete operations.
-- **Pagination**: Offset/Limit and Cursor-based pagination.
-- **Full-Text Search**: Built-in integration with SQLite FTS5.
-- **Key-Value Store**: An integrated dict-like persistent KV store.
+```python
+User.create_table()
+User.create(name="Ada", age=36)
+users = User.filter(age__gte=18).all()
+```
 
-## Next Steps
+## Features
 
-- Read the [User Guide](user_guide.md) to learn how to use Obele effectively.
-- Explore the [API Reference](api/orm.md) for detailed information on classes and methods.
+- Sync and async model, query, search, database, and KVStore APIs.
+- Native async SQLite access via `Database.aexecute()`, `Database.afetchone()`,
+  `Database.afetchall()`, and `async_connect()`.
+- Thread-safe SQLite connection management with WAL mode, transactions,
+  savepoints, scoped bindings, and optional query logging.
+- Declarative fields, validation, foreign keys, reverse relations, mixins,
+  signals, full-text search, and pagination.
+- Persistent `KVStore` with TTL, namespaces, atomic operations, serializers,
+  prefix/range/scan queries, and async equivalents.
+
+## Where To Go Next
+
+- Read the [User Guide](user_guide.md) for examples and patterns.
+- Browse the [ORM API](api/orm.md), [Query API](api/queries.md),
+  [Fields API](api/fields.md), and [KVStore API](api/kv.md).

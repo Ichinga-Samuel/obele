@@ -18,7 +18,6 @@ cursor-based pagination::
 
 from __future__ import annotations
 
-import asyncio
 import math
 from dataclasses import dataclass
 from typing import Any, TYPE_CHECKING
@@ -130,7 +129,25 @@ def paginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Pa
 
 async def apaginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Page:
     """Async version of :func:`paginate_queryset`."""
-    return await asyncio.to_thread(paginate_queryset, queryset, page=page, per_page=per_page)
+    if page < 1:
+        raise ValueError("page must be >= 1")
+    if per_page < 1:
+        raise ValueError("per_page must be >= 1")
+
+    total = await queryset.acount()
+    pages = max(1, math.ceil(total / per_page))
+    offset = (page - 1) * per_page
+    items = await queryset.offset(offset).limit(per_page).aall()
+
+    return Page(
+        items=items,
+        page=page,
+        per_page=per_page,
+        total=total,
+        pages=pages,
+        has_next=page < pages,
+        has_prev=page > 1,
+    )
 
 
 def cursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
@@ -176,13 +193,32 @@ def cursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field:
 async def acursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
                                     before: Any = None,) -> CursorPage:
     """Async version of :func:`cursor_paginate_queryset`."""
-    return await asyncio.to_thread(
-        cursor_paginate_queryset,
-        queryset,
+    if per_page < 1:
+        raise ValueError("per_page must be >= 1")
+
+    field = cursor_field or queryset.model_cls._pk_name
+
+    if after is not None:
+        queryset = queryset.filter(**{f"{field}__gt": after})
+    elif before is not None:
+        queryset = queryset.filter(**{f"{field}__lt": before})
+
+    items = await queryset.limit(per_page + 1).aall()
+    has_next = len(items) > per_page
+    if has_next:
+        items = items[:per_page]
+
+    has_prev = after is not None or before is not None
+    start = getattr(items[0], field, None) if items else None
+    end = getattr(items[-1], field, None) if items else None
+
+    return CursorPage(
+        items=items,
         per_page=per_page,
-        cursor_field=cursor_field,
-        after=after,
-        before=before,
+        has_next=has_next,
+        has_prev=has_prev,
+        start_cursor=start,
+        end_cursor=end,
     )
 
 

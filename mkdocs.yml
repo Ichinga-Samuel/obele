@@ -7,29 +7,9 @@ repo_name: ichinga-samuel/obele
 repo_url: https://github.com/ichinga-samuel/obele
 
 theme:
-  name: material
-  features:
-    - navigation.tabs
-    - navigation.sections
-    - navigation.expand
-    - navigation.top
-    - search.suggest
-    - search.highlight
-    - content.code.copy
-    - content.code.annotate
-  palette:
-    - scheme: default
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-7
-        name: Switch to dark mode
-    - scheme: slate
-      primary: indigo
-      accent: indigo
-      toggle:
-        icon: material/brightness-4
-        name: Switch to light mode
+  name: readthedocs
+  navigation_depth: 4
+  collapse_navigation: false
 
 plugins:
   - search

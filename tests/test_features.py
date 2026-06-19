@@ -240,7 +240,6 @@ class TestFTS:
 
 
 # ---- Database Features ----------------------------------------------------
-
 class TestDatabaseFeatures:
     def test_pool_status(self):
         s = Database.pool_status()

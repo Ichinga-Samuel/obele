@@ -28,7 +28,6 @@ ORM models::
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any, TYPE_CHECKING
 
 from .database import Database
@@ -117,7 +116,26 @@ class SearchIndex:
 
     async def acreate(self) -> None:
         """Async version of :meth:`create`."""
-        await asyncio.to_thread(self.create)
+        columns = ", ".join(self._field_columns)
+        source = self.model_cls.table_name
+        pk_col = self.model_cls._pk_field.column_name
+
+        if self.content_sync:
+            sql = (
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.fts_table} "
+                f"USING fts5({columns}, content={source!r}, "
+                f"content_rowid={pk_col!r}, tokenize={self.tokenizer!r})"
+            )
+        else:
+            sql = (
+                f"CREATE VIRTUAL TABLE IF NOT EXISTS {self.fts_table} "
+                f"USING fts5({columns}, tokenize={self.tokenizer!r})"
+            )
+        cursor = await Database.aexecute(sql)
+        await cursor.close()
+
+        if self.content_sync:
+            await self._acreate_triggers()
 
     def drop(self) -> None:
         """Drop the FTS5 virtual table and associated triggers."""
@@ -127,7 +145,10 @@ class SearchIndex:
 
     async def adrop(self) -> None:
         """Async version of :meth:`drop`."""
-        await asyncio.to_thread(self.drop)
+        if self.content_sync:
+            await self._adrop_triggers()
+        cursor = await Database.aexecute(f"DROP TABLE IF EXISTS {self.fts_table}")
+        await cursor.close()
 
     def _create_triggers(self) -> None:
         """Create INSERT/UPDATE/DELETE triggers to keep FTS in sync."""
@@ -171,6 +192,49 @@ class SearchIndex:
         for suffix in ("ai", "ad", "au"):
             Database.execute(f"DROP TRIGGER IF EXISTS {fts}_{suffix}")
 
+    async def _acreate_triggers(self) -> None:
+        """Async version of :meth:`_create_triggers`."""
+        source = self.model_cls.table_name
+        pk_col = self.model_cls._pk_field.column_name
+        fts = self.fts_table
+        cols = ", ".join(self._field_columns)
+        new_cols = ", ".join(f"new.{c}" for c in self._field_columns)
+        old_cols = ", ".join(f"old.{c}" for c in self._field_columns)
+
+        trigger_sqls = [
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {fts}_ai AFTER INSERT ON {source}
+            BEGIN
+                INSERT INTO {fts}(rowid, {cols}) VALUES (new.{pk_col}, {new_cols});
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {fts}_ad AFTER DELETE ON {source}
+            BEGIN
+                INSERT INTO {fts}({fts}, rowid, {cols})
+                VALUES ('delete', old.{pk_col}, {old_cols});
+            END
+            """,
+            f"""
+            CREATE TRIGGER IF NOT EXISTS {fts}_au AFTER UPDATE ON {source}
+            BEGIN
+                INSERT INTO {fts}({fts}, rowid, {cols})
+                VALUES ('delete', old.{pk_col}, {old_cols});
+                INSERT INTO {fts}(rowid, {cols}) VALUES (new.{pk_col}, {new_cols});
+            END
+            """,
+        ]
+        for sql in trigger_sqls:
+            cursor = await Database.aexecute(sql)
+            await cursor.close()
+
+    async def _adrop_triggers(self) -> None:
+        """Async version of :meth:`_drop_triggers`."""
+        fts = self.fts_table
+        for suffix in ("ai", "ad", "au"):
+            cursor = await Database.aexecute(f"DROP TRIGGER IF EXISTS {fts}_{suffix}")
+            await cursor.close()
+
     # ---- Data management --------------------------------------------------
 
     def rebuild(self) -> None:
@@ -184,7 +248,10 @@ class SearchIndex:
 
     async def arebuild(self) -> None:
         """Async version of :meth:`rebuild`."""
-        await asyncio.to_thread(self.rebuild)
+        cursor = await Database.aexecute(
+            f"INSERT INTO {self.fts_table}({self.fts_table}) VALUES ('rebuild')"
+        )
+        await cursor.close()
 
     def optimize(self) -> None:
         """Run FTS5 merge optimization."""
@@ -194,7 +261,10 @@ class SearchIndex:
 
     async def aoptimize(self) -> None:
         """Async version of :meth:`optimize`."""
-        await asyncio.to_thread(self.optimize)
+        cursor = await Database.aexecute(
+            f"INSERT INTO {self.fts_table}({self.fts_table}) VALUES ('optimize')"
+        )
+        await cursor.close()
 
     # ---- Search -----------------------------------------------------------
 
@@ -250,9 +320,32 @@ class SearchIndex:
         offset: int | None = None,
     ) -> list[Model]:
         """Async version of :meth:`search`."""
-        return await asyncio.to_thread(
-            self.search, query, limit=limit, offset=offset,
+        if not query or not query.strip():
+            return []
+
+        source = self.model_cls.table_name
+        pk_col = self.model_cls._pk_field.column_name
+        fts = self.fts_table
+
+        sql = (
+            f"SELECT {source}.* FROM {source} "
+            f"INNER JOIN {fts} ON {source}.{pk_col} = {fts}.rowid "
+            f"WHERE {fts} MATCH ? "
+            f"ORDER BY {fts}.rank"
         )
+        params: list[Any] = [query]
+
+        if limit is not None:
+            sql += " LIMIT ?"
+            params.append(limit)
+        if offset is not None:
+            if limit is None:
+                sql += " LIMIT -1"
+            sql += " OFFSET ?"
+            params.append(offset)
+
+        rows = await Database.afetchall(sql, params)
+        return [self.model_cls._from_row(dict(row)) for row in rows]
 
     def search_count(self, query: str) -> int:
         """Return the number of rows matching the FTS query."""
@@ -268,7 +361,15 @@ class SearchIndex:
 
     async def asearch_count(self, query: str) -> int:
         """Async version of :meth:`search_count`."""
-        return await asyncio.to_thread(self.search_count, query)
+        if not query or not query.strip():
+            return 0
+        fts = self.fts_table
+        count = await Database.afetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {fts} WHERE {fts} MATCH ?",
+            [query],
+            column="cnt",
+        )
+        return int(count or 0)
 
     def __repr__(self) -> str:
         return (

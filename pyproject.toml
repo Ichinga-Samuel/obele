@@ -35,8 +35,8 @@ dev = [
 ]
 docs = [
     "mkdocs>=1.6.0",
-    "mkdocs-material>=9.5.0",
     "mkdocstrings[python]>=0.25.0",
+    "pymdown-extensions>=10.0",
 ]
 
 [project.scripts]
@@ -52,3 +52,4 @@ include = ["obele*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+pythonpath = ["."]

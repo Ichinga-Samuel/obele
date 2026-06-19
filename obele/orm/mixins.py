@@ -23,7 +23,6 @@ composed with :class:`~obele.orm.model.Model` via multiple inheritance::
 
 from __future__ import annotations
 
-import asyncio
 import datetime
 from typing import Any, ClassVar
 
@@ -51,7 +50,11 @@ class TimestampMixin:
 
     async def asave(self) -> None:
         """Async version of :meth:`save`."""
-        await asyncio.to_thread(self.save)
+        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        if not getattr(self, "_persisted", False):
+            self.__dict__["created_at"] = now
+        self.__dict__["updated_at"] = now
+        await super().asave()
 
 
 class SoftDeleteMixin:
@@ -76,7 +79,12 @@ class SoftDeleteMixin:
 
     async def adelete(self) -> None:
         """Async version of :meth:`delete`."""
-        await asyncio.to_thread(self.delete)
+        pk_value = self.__dict__.get(self._pk_name)
+        if pk_value is None:
+            raise RecordNotFoundError("Cannot delete an unsaved instance")
+        self.__dict__["is_deleted"] = True
+        self.__dict__["deleted_at"] = datetime.datetime.now(tz=datetime.timezone.utc)
+        await self.asave()
 
     def hard_delete(self) -> None:
         """Permanently remove this instance from the database."""
@@ -86,7 +94,8 @@ class SoftDeleteMixin:
 
     async def ahard_delete(self) -> None:
         """Async version of :meth:`hard_delete`."""
-        await asyncio.to_thread(self.hard_delete)
+        from .model import Model
+        await Model.adelete(self)
 
     def restore(self) -> None:
         """Un-delete a soft-deleted instance."""
@@ -96,7 +105,9 @@ class SoftDeleteMixin:
 
     async def arestore(self) -> None:
         """Async version of :meth:`restore`."""
-        await asyncio.to_thread(self.restore)
+        self.__dict__["is_deleted"] = False
+        self.__dict__["deleted_at"] = None
+        await self.asave()
 
     @classmethod
     def _queryset(cls) -> Any:

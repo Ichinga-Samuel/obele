@@ -1,11 +1,8 @@
 """Shared test fixtures and configuration for obele tests."""
 
-import os
 import pytest
 
 from obele import Database
-
-DB_PATH = os.path.join(os.path.dirname(__file__), "_test.sqlite3")
 
 
 @pytest.fixture(autouse=True)

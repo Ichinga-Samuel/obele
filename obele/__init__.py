@@ -17,6 +17,12 @@ Usage::
 """
 
 from ._identity import PACKAGE_NAME
+from . import asqlite
+from .asqlite import (
+    connect as async_connect,
+    Connection as AsyncSQLiteConnection,
+    Cursor as AsyncSQLiteCursor,
+)
 from .orm import (
     Database,
     Field,
@@ -138,4 +144,8 @@ __all__ = [
     "ConfigurationError",
     "KVStore",
     "KV",
+    "asqlite",
+    "async_connect",
+    "AsyncSQLiteConnection",
+    "AsyncSQLiteCursor",
 ]

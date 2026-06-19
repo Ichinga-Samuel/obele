@@ -10,7 +10,6 @@ Async counterparts are prefixed with ``a`` (for example ``aall`` and
 
 from __future__ import annotations
 
-import asyncio
 import copy
 from dataclasses import dataclass
 from typing import Any, Iterator, AsyncIterator, TYPE_CHECKING
@@ -762,14 +761,17 @@ class QuerySet:
     async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator:
         """Async streaming results."""
         sql, params = self._build_select()
-        cursor = await asyncio.to_thread(Database.execute_read, sql, params)
+        cursor = await Database.aexecute_read(sql, params)
         converter = self._row_to_values if self._values_fields is not None else self._row_to_instance
-        while True:
-            rows = await asyncio.to_thread(cursor.fetchmany, chunk_size)
-            if not rows:
-                break
-            for row in rows:
-                yield converter(row)
+        try:
+            while True:
+                rows = await cursor.fetchmany(chunk_size)
+                if not rows:
+                    break
+                for row in rows:
+                    yield converter(row)
+        finally:
+            await cursor.close()
 
     # ------------------------------------------------------------------
     # Aggregation
@@ -916,6 +918,46 @@ class QuerySet:
                 cache_key = f"_prefetch_{relation_name}"
                 inst.__dict__[cache_key] = items
 
+    async def _ado_prefetch(self, instances: list) -> None:
+        """Async version of :meth:`_do_prefetch`."""
+        if not instances:
+            return
+
+        for relation_name in self._prefetch_relations:
+            reverse_relations: dict = getattr(
+                self.model_cls, "_reverse_relations", {},
+            )
+            descriptor = reverse_relations.get(relation_name)
+            if descriptor is None:
+                raise ValueError(
+                    f"'{relation_name}' is not a known reverse relation on "
+                    f"{self.model_cls.__name__}"
+                )
+
+            related_model = descriptor.related_model
+            fk_field_name = descriptor.field_name
+            pk_values = [
+                inst.__dict__.get(inst._pk_name)
+                for inst in instances
+                if inst.__dict__.get(inst._pk_name) is not None
+            ]
+            if not pk_values:
+                continue
+
+            related_items = await related_model.filter(
+                **{f"{fk_field_name}__in": pk_values}
+            ).aall()
+
+            grouped: dict[Any, list] = {}
+            for item in related_items:
+                fk_val = item.__dict__.get(fk_field_name)
+                grouped.setdefault(fk_val, []).append(item)
+
+            for inst in instances:
+                pk = inst.__dict__.get(inst._pk_name)
+                cache_key = f"_prefetch_{relation_name}"
+                inst.__dict__[cache_key] = grouped.get(pk, [])
+
     # ------------------------------------------------------------------
     # Bulk write operations
     # ------------------------------------------------------------------
@@ -964,28 +1006,93 @@ class QuerySet:
     # ------------------------------------------------------------------
 
     async def aall(self) -> list:
-        return await asyncio.to_thread(self.all)
+        results = [item async for item in self.aiterator()]
+        if self._prefetch_relations:
+            await self._ado_prefetch(results)
+        return results
 
     async def afirst(self) -> Any:
-        return await asyncio.to_thread(self.first)
+        async for item in self.limit(1).aiterator():
+            return item
+        return None
 
     async def aget(self, **kwargs: Any) -> Model:
-        return await asyncio.to_thread(self.get, **kwargs)
+        qs = self.filter(**kwargs) if kwargs else self._clone()
+        results = [item async for item in qs.limit(2).aiterator()]
+        if len(results) == 0:
+            raise RecordNotFoundError(
+                f"No {self.model_cls.__name__} matches the given query"
+            )
+        if len(results) > 1:
+            raise MultipleResultsError(
+                f"Expected 1 {self.model_cls.__name__}, got {len(results)}"
+            )
+        return results[0]
 
     async def acount(self) -> int:
-        return await asyncio.to_thread(self.count)
+        sql, params = self._build_select()
+        count_sql = f"SELECT COUNT(*) AS cnt FROM ({sql})"
+        return int(await Database.afetch_value(count_sql, params, column="cnt") or 0)
 
     async def aexists(self) -> bool:
-        return await asyncio.to_thread(self.exists)
+        sql, params = self._build_select()
+        row = await Database.afetchone(f"SELECT 1 FROM ({sql}) LIMIT 1", params)
+        return row is not None
 
     async def aaggregate(self, func: str, field: str) -> Any:
-        return await asyncio.to_thread(self.aggregate, func, field)
+        func = func.upper()
+        if func not in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
+            raise ValueError(f"Unsupported aggregate function: {func}")
+        col, _ = self._resolve_field_reference(field.split("__"))
+        base_sql, params = self._build_select(
+            select_override=[f"{col} AS __agg_target__"],
+            include_annotations=False,
+        )
+        agg_sql = f"SELECT {func}(__agg_target__) AS result FROM ({base_sql})"
+        return await Database.afetch_value(agg_sql, params, column="result")
 
-    async def aupdate(self, **kwargs: Any) -> int:
-        return await asyncio.to_thread(self.update, **kwargs)
+    async def aupdate(self, *, validate: bool = True, **kwargs: Any) -> int:
+        if not kwargs:
+            raise ValueError("update() requires at least one field")
+        if self._join_specs:
+            raise ValueError("update() does not support joined filters")
+        set_parts: list[str] = []
+        set_params: list[Any] = []
+        for key, value in kwargs.items():
+            field_obj = self.model_cls._fields.get(key)
+            col = field_obj.column_name if field_obj else key
+            if validate and field_obj:
+                field_obj.validate(value)
+            db_val = field_obj.to_db(value) if field_obj else value
+            set_parts.append(f"{col} = ?")
+            set_params.append(db_val)
+
+        sql = f"UPDATE {self.model_cls.table_name} SET {', '.join(set_parts)}"
+        where_params: list[Any] = []
+        if self._where_fragments:
+            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
+            for _, fp in self._where_fragments:
+                where_params.extend(fp)
+        cursor = await Database.aexecute(sql, set_params + where_params)
+        try:
+            return cursor.rowcount
+        finally:
+            await cursor.close()
 
     async def adelete(self) -> int:
-        return await asyncio.to_thread(self.delete)
+        if self._join_specs:
+            raise ValueError("delete() does not support joined filters")
+        sql = f"DELETE FROM {self.model_cls.table_name}"
+        params: list[Any] = []
+        if self._where_fragments:
+            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
+            for _, fp in self._where_fragments:
+                params.extend(fp)
+        cursor = await Database.aexecute(sql, params)
+        try:
+            return cursor.rowcount
+        finally:
+            await cursor.close()
 
     # ------------------------------------------------------------------
     # Internal: Q compilation
