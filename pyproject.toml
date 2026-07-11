@@ -1,6 +1,6 @@
 [project]
 name = "obele"
-version = "0.1.0b1"
+version = "0.1.0"
 description = "A lightweight, async-ready ORM for SQLite"
 readme = "README.md"
 license = {text = "MIT"}
