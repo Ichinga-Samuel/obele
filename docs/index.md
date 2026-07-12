@@ -75,8 +75,6 @@ users = User.filter(age__gte=18).all()
 - Read [Architecture and Execution Model](architecture.md) to understand how
   database routing, fields, models, queries, async work, and KV storage fit
   together.
-- Use the [Complete Source Reference](internals.md) for a symbol-by-symbol
-  explanation of every module, constant, class, helper, and method.
 - See the [Migration CLI](cli.md) for schema synchronization.
 - Browse the [ORM API](api/orm.md), [Query API](api/queries.md),
   [Fields API](api/fields.md), and [KVStore API](api/kv.md).

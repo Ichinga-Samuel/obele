@@ -40,7 +40,6 @@ nav:
   - Home: index.md
   - User Guide: user_guide.md
   - Architecture: architecture.md
-  - Complete Source Reference: internals.md
   - Migration CLI: cli.md
   - API Reference:
       - ORM: api/orm.md

@@ -2,8 +2,7 @@
 
 This chapter explains how Obele works as a system. It follows data from a
 model declaration through SQL generation, SQLite execution, row hydration,
-and the asynchronous wrappers. The [source reference](internals.md) then
-documents every module-level constant, helper, class, and method.
+and the asynchronous wrappers.
 
 ## The Big Picture
 

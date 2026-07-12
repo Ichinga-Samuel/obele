@@ -154,7 +154,6 @@ enabled = await settings.aget("feature:search")
 
 - [User Guide](docs/user_guide.md)
 - [Architecture and Execution Model](docs/architecture.md)
-- [Complete Source Reference](docs/internals.md)
 - [Migration CLI](docs/cli.md)
 - [API Reference](docs/api/orm.md)
 - [Queries](docs/api/queries.md)
