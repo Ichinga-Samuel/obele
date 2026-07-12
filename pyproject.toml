@@ -1,7 +1,7 @@
 [project]
 name = "obele"
-version = "0.1.0"
-description = "A lightweight, async-ready ORM for SQLite"
+version = "1.0.0"
+description = "A lightweight, async-ready ORM and key-value store for SQLite"
 readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.13"
@@ -11,7 +11,7 @@ authors = [
 ]
 keywords = ["orm", "sqlite", "async", "database", "sql"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",

@@ -17,6 +17,8 @@ aggregates, set operations, pagination, and full-text search.
 
 ::: obele.Func
 
+::: obele.CombinedExpression
+
 ::: obele.Count
 
 ::: obele.Sum

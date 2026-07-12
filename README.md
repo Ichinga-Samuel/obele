@@ -7,13 +7,16 @@ supporting both synchronous code and native asyncio workflows.
 ## Highlights
 
 - Sync and async APIs for models, queries, raw SQL, search, and KV operations.
-- Async SQLite integration through the bundled `obele.asqlite` bridge.
-- Thread-safe SQLite connection management with transactions, savepoints,
-  scoped database bindings, WAL mode, and query logging.
+  Every method has an `a`-prefixed async twin that runs on a worker thread, so
+  transactions and scoped bindings behave identically in both worlds.
+- Thread-safe SQLite connection management: per-thread connections under WAL
+  mode, transactions with savepoint nesting, scoped database bindings, and
+  query logging. Plain `":memory:"` databases are shared across threads.
 - Declarative models with field validation, foreign keys, reverse relations,
-  mixins, signals, pagination, and FTS5 search indexes.
+  expressions (`F("views") + 1`), lazy slicing, prefetching, mixins, signals,
+  pagination, and FTS5 search indexes.
 - Persistent dict-like `KVStore` with namespaces, TTL, atomic operations,
-  range/prefix/scan queries, serializers, and async methods.
+  range/prefix/scan queries, memoization, serializers, and async methods.
 
 ## Requirements
 
@@ -87,22 +90,27 @@ print(cursor.lastrowid)
 row = Database.fetchone("SELECT name FROM users WHERE id = ?", [cursor.lastrowid])
 ```
 
-Async helpers use the bundled async SQLite connection and return async cursors:
+Async helpers return fully materialized results - no cursors to manage:
 
 ```python
-cursor = await Database.aexecute(
+result = await Database.aexecute(
     "INSERT INTO users (name, age) VALUES (?, ?)",
     ["Linus", 33],
 )
-await cursor.close()
+print(result.lastrowid)
 
 row = await Database.afetchone("SELECT name FROM users WHERE age > ?", [30])
 ```
 
+`Database.aexecute()` and `Database.aexecutemany()` return an `ExecResult`
+containing `rows`, `rowcount`, and `lastrowid`; there is no async cursor to
+close. The former `obele.asqlite` and raw async-connection exports are no
+longer part of the public API.
+
 ## Transactions And Scoped Databases
 
 ```python
-with Database.transaction():
+with Database.transaction(mode="IMMEDIATE"):
     User.create(name="One")
     User.create(name="Two")
 
@@ -110,6 +118,9 @@ async with Database.transaction():
     await User.acreate(name="Async One")
     await User.acreate(name="Async Two")
 ```
+
+Transaction modes are `DEFERRED`, `IMMEDIATE` (the default), and `EXCLUSIVE`.
+Nested transactions use savepoints.
 
 Use scoped bindings for tests, tenants, or short-lived alternate databases:
 
@@ -142,6 +153,9 @@ enabled = await settings.aget("feature:search")
 ## Documentation
 
 - [User Guide](docs/user_guide.md)
+- [Architecture and Execution Model](docs/architecture.md)
+- [Complete Source Reference](docs/internals.md)
+- [Migration CLI](docs/cli.md)
 - [API Reference](docs/api/orm.md)
 - [Queries](docs/api/queries.md)
 - [Fields](docs/api/fields.md)

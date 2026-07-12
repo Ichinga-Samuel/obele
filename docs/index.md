@@ -1,8 +1,10 @@
 # Obele
 
 Obele is a lightweight SQLite ORM and key-value store for modern Python
-applications. It provides a small, Django-like model and query API, plus native
-asyncio support through the bundled `obele.asqlite` bridge.
+applications. It provides a small, Django-like model and query API. Every
+method has an async twin (`aall`, `acreate`, ...) that runs on a worker
+thread, so transactions and scoped bindings behave identically in sync and
+async code.
 
 ## Install
 
@@ -55,17 +57,26 @@ users = User.filter(age__gte=18).all()
 ## Features
 
 - Sync and async model, query, search, database, and KVStore APIs.
-- Native async SQLite access via `Database.aexecute()`, `Database.afetchone()`,
-  `Database.afetchall()`, and `async_connect()`.
-- Thread-safe SQLite connection management with WAL mode, transactions,
-  savepoints, scoped bindings, and optional query logging.
-- Declarative fields, validation, foreign keys, reverse relations, mixins,
-  signals, full-text search, and pagination.
+- Async SQL access via `Database.aexecute()`, `Database.afetchone()`, and
+  `Database.afetchall()` - results come back fully materialized, with no
+  cursors to manage.
+- Thread-safe SQLite connection management with WAL mode, per-thread read
+  connections, transactions with savepoint nesting, scoped bindings, and
+  optional query logging.
+- Declarative fields, validation, foreign keys, reverse relations,
+  expressions (`F("views") + 1`), mixins, signals, full-text search, and
+  pagination.
 - Persistent `KVStore` with TTL, namespaces, atomic operations, serializers,
-  prefix/range/scan queries, and async equivalents.
+  prefix/range/scan queries, memoization, and async equivalents.
 
 ## Where To Go Next
 
 - Read the [User Guide](user_guide.md) for examples and patterns.
+- Read [Architecture and Execution Model](architecture.md) to understand how
+  database routing, fields, models, queries, async work, and KV storage fit
+  together.
+- Use the [Complete Source Reference](internals.md) for a symbol-by-symbol
+  explanation of every module, constant, class, helper, and method.
+- See the [Migration CLI](cli.md) for schema synchronization.
 - Browse the [ORM API](api/orm.md), [Query API](api/queries.md),
   [Fields API](api/fields.md), and [KVStore API](api/kv.md).

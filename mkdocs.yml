@@ -1,5 +1,5 @@
 site_name: obele
-site_description: A lightweight, async-ready ORM for SQLite
+site_description: A lightweight, async-ready ORM and key-value store for SQLite
 site_author: Ichinga Samuel
 site_url: https://ichinga-samuel.github.io/obele/
 
@@ -39,8 +39,12 @@ markdown_extensions:
 nav:
   - Home: index.md
   - User Guide: user_guide.md
+  - Architecture: architecture.md
+  - Complete Source Reference: internals.md
+  - Migration CLI: cli.md
   - API Reference:
       - ORM: api/orm.md
       - Fields: api/fields.md
       - Queries: api/queries.md
       - Key-Value Store: api/kv.md
+      - Signals and Errors: api/signals_errors.md

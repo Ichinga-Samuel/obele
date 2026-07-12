@@ -241,9 +241,10 @@ class TestFTS:
 
 # ---- Database Features ----------------------------------------------------
 class TestDatabaseFeatures:
-    def test_pool_status(self):
-        s = Database.pool_status()
-        assert "active_connections" in s
+    def test_status(self):
+        s = Database.status()
+        assert "open_connections" in s
+        assert s["is_memory"] is True
 
     def test_integrity_check(self):
         assert Database.integrity_check() == "ok"

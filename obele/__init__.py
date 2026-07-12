@@ -1,4 +1,4 @@
-"""obele - A lightweight, async-ready ORM for SQLite.
+"""obele - a lightweight, async-ready ORM and key-value store for SQLite.
 
 Usage::
 
@@ -14,17 +14,17 @@ Usage::
     User.create_table()
     alice = User.create(name="Alice", age=30)
     users = User.filter(age__gte=18).order_by("name").all()
+
+    # The same API is async-ready:
+    users = await User.filter(age__gte=18).order_by("name").aall()
 """
 
 from ._identity import PACKAGE_NAME
-from . import asqlite
-from .asqlite import (
-    connect as async_connect,
-    Connection as AsyncSQLiteConnection,
-    Cursor as AsyncSQLiteCursor,
-)
 from .orm import (
     Database,
+    DatabaseScope,
+    ExecResult,
+    Transaction,
     Field,
     IntegerField,
     TextField,
@@ -47,12 +47,18 @@ from .orm import (
     Model,
     ReverseRelationManager,
     ReverseRelationDescriptor,
+    create_all,
+    acreate_all,
+    drop_all,
+    adrop_all,
+    registered_models,
     QuerySet,
     Q,
     F,
     Value,
     RawSQL,
     Func,
+    CombinedExpression,
     Count,
     Sum,
     Avg,
@@ -87,15 +93,24 @@ __title__ = PACKAGE_NAME
 
 __all__ = [
     "Database",
+    "DatabaseScope",
+    "ExecResult",
+    "Transaction",
     "Model",
     "ReverseRelationManager",
     "ReverseRelationDescriptor",
+    "create_all",
+    "acreate_all",
+    "drop_all",
+    "adrop_all",
+    "registered_models",
     "QuerySet",
     "Q",
     "F",
     "Value",
     "RawSQL",
     "Func",
+    "CombinedExpression",
     "Count",
     "Sum",
     "Avg",
@@ -144,8 +159,4 @@ __all__ = [
     "ConfigurationError",
     "KVStore",
     "KV",
-    "asqlite",
-    "async_connect",
-    "AsyncSQLiteConnection",
-    "AsyncSQLiteCursor",
 ]

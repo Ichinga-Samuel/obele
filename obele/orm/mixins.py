@@ -1,7 +1,6 @@
 """Reusable model mixins for common patterns.
 
-Provides :class:`TimestampMixin` and :class:`SoftDeleteMixin` that can be
-composed with :class:`~obele.orm.model.Model` via multiple inheritance::
+Compose with :class:`~obele.orm.model.Model` via multiple inheritance::
 
     from obele import Model, TimestampMixin, SoftDeleteMixin
 
@@ -12,13 +11,15 @@ composed with :class:`~obele.orm.model.Model` via multiple inheritance::
     article.created_at   # auto-set on insert
     article.updated_at   # auto-set on every save
 
-    article.delete()     # soft-deletes (sets is_deleted=True, deleted_at=now)
+    article.delete()     # soft-delete (is_deleted=True, deleted_at=now)
     Article.all()        # excludes soft-deleted rows
-    Article.with_deleted().all()   # includes soft-deleted
-    Article.only_deleted().all()   # only soft-deleted
-
-    article.restore()    # un-deletes
+    Article.with_deleted().all()
+    Article.only_deleted().all()
+    article.restore()
     article.hard_delete()  # permanent removal
+
+The async methods (``asave``, ``adelete``, ...) inherited from ``Model``
+automatically pick up these overrides - no async twins needed here.
 """
 
 from __future__ import annotations
@@ -26,76 +27,46 @@ from __future__ import annotations
 import datetime
 from typing import Any, ClassVar
 
+from .database import awrite
 from .fields import DateTimeField, BooleanField
 from .exceptions import RecordNotFoundError
 
 
+def _utcnow() -> datetime.datetime:
+    return datetime.datetime.now(tz=datetime.timezone.utc)
+
+
 class TimestampMixin:
-    """Adds ``created_at`` and ``updated_at`` auto-managed fields.
+    """Adds auto-managed ``created_at`` and ``updated_at`` fields."""
 
-    ``created_at`` is set once on first save.  ``updated_at`` is refreshed
-    on every save.
-    """
-
-    created_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True,)
-    updated_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True,)
+    created_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True)
+    updated_at: ClassVar[DateTimeField] = DateTimeField(nullable=True, index=True)
 
     def save(self) -> None:
-        """Override save to auto-set timestamps."""
-        now = datetime.datetime.now(tz=datetime.timezone.utc)
+        now = _utcnow()
         if not getattr(self, "_persisted", False):
             self.__dict__["created_at"] = now
         self.__dict__["updated_at"] = now
         super().save()
 
-    async def asave(self) -> None:
-        """Async version of :meth:`save`."""
-        now = datetime.datetime.now(tz=datetime.timezone.utc)
-        if not getattr(self, "_persisted", False):
-            self.__dict__["created_at"] = now
-        self.__dict__["updated_at"] = now
-        await super().asave()
-
 
 class SoftDeleteMixin:
-    """Adds soft-delete support via ``is_deleted`` and ``deleted_at`` fields.
+    """Soft-delete support via ``is_deleted`` / ``deleted_at``.
 
-    Calling :meth:`delete` sets ``is_deleted=True`` and ``deleted_at=now``
-    instead of removing the row.  Use :meth:`hard_delete` for permanent
-    removal.  Default queries exclude soft-deleted rows.
+    :meth:`delete` marks the row deleted instead of removing it; default
+    queries exclude soft-deleted rows.
     """
 
-    is_deleted: ClassVar[BooleanField] = BooleanField(default=False, index=True,)
-    deleted_at: ClassVar[DateTimeField] = DateTimeField(nullable=True,)
+    is_deleted: ClassVar[BooleanField] = BooleanField(default=False, index=True)
+    deleted_at: ClassVar[DateTimeField] = DateTimeField(nullable=True)
 
     def delete(self) -> None:
         """Soft-delete this instance (mark as deleted, keep the row)."""
-        pk_value = self.__dict__.get(self._pk_name)
-        if pk_value is None:
+        if self.pk is None:
             raise RecordNotFoundError("Cannot delete an unsaved instance")
         self.__dict__["is_deleted"] = True
-        self.__dict__["deleted_at"] = datetime.datetime.now(tz=datetime.timezone.utc)
+        self.__dict__["deleted_at"] = _utcnow()
         self.save()
-
-    async def adelete(self) -> None:
-        """Async version of :meth:`delete`."""
-        pk_value = self.__dict__.get(self._pk_name)
-        if pk_value is None:
-            raise RecordNotFoundError("Cannot delete an unsaved instance")
-        self.__dict__["is_deleted"] = True
-        self.__dict__["deleted_at"] = datetime.datetime.now(tz=datetime.timezone.utc)
-        await self.asave()
-
-    def hard_delete(self) -> None:
-        """Permanently remove this instance from the database."""
-        from .model import Model
-        # Call the real Model.delete (bypassing SoftDeleteMixin.delete)
-        Model.delete(self)
-
-    async def ahard_delete(self) -> None:
-        """Async version of :meth:`hard_delete`."""
-        from .model import Model
-        await Model.adelete(self)
 
     def restore(self) -> None:
         """Un-delete a soft-deleted instance."""
@@ -105,13 +76,20 @@ class SoftDeleteMixin:
 
     async def arestore(self) -> None:
         """Async version of :meth:`restore`."""
-        self.__dict__["is_deleted"] = False
-        self.__dict__["deleted_at"] = None
-        await self.asave()
+        await awrite(self.restore)
+
+    def hard_delete(self) -> None:
+        """Permanently remove this instance from the database."""
+        from .model import Model
+        Model.delete(self)
+
+    async def ahard_delete(self) -> None:
+        """Async version of :meth:`hard_delete`."""
+        await awrite(self.hard_delete)
 
     @classmethod
     def _queryset(cls) -> Any:
-        """Override to exclude soft-deleted rows by default."""
+        """Exclude soft-deleted rows by default."""
         from .query import QuerySet
         return QuerySet(cls).filter(is_deleted=False)
 

@@ -1,6 +1,6 @@
 """ORM subpackage exports for obele."""
 
-from .database import Database
+from .database import Database, DatabaseScope, ExecResult, Transaction
 from .exceptions import (
     ORMError,
     FieldValidationError,
@@ -33,9 +33,21 @@ from .fields import (
     IPAddressField,
 )
 from .mixins import TimestampMixin, SoftDeleteMixin
-from .model import Model, ReverseRelationManager, ReverseRelationDescriptor
+from .model import (
+    Model,
+    ReverseRelationManager,
+    ReverseRelationDescriptor,
+    create_all,
+    acreate_all,
+    drop_all,
+    adrop_all,
+    registered_models,
+)
 from .pagination import Page, CursorPage
-from .query import QuerySet, Q, F, Value, RawSQL, Func, Count, Sum, Avg, Min, Max, Subquery
+from .query import (
+    QuerySet, Q, F, Value, RawSQL, Func, CombinedExpression,
+    Count, Sum, Avg, Min, Max, Subquery,
+)
 from .search import SearchIndex
 from .signals import (
     Signal,
@@ -50,15 +62,24 @@ from .signals import (
 
 __all__ = [
     "Database",
+    "DatabaseScope",
+    "ExecResult",
+    "Transaction",
     "Model",
     "ReverseRelationManager",
     "ReverseRelationDescriptor",
+    "create_all",
+    "acreate_all",
+    "drop_all",
+    "adrop_all",
+    "registered_models",
     "QuerySet",
     "Q",
     "F",
     "Value",
     "RawSQL",
     "Func",
+    "CombinedExpression",
     "Count",
     "Sum",
     "Avg",

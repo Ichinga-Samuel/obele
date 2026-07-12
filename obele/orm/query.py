@@ -1,20 +1,19 @@
 """Fluent query builder for the ORM with sync and async APIs.
 
 ``QuerySet`` instances are returned from ``Model.filter()`` and friends.
-They are lazily evaluated - SQL is only executed when results are
-materialized (via ``all()``, ``first()``, iteration, etc.).
-
-Async counterparts are prefixed with ``a`` (for example ``aall`` and
-``afirst``).
+They are lazily evaluated - SQL only runs when results are materialized
+(``all()``, ``first()``, iteration, slicing, ...).  Async counterparts are
+prefixed with ``a`` (``aall``, ``afirst``) and run the query on a worker
+thread, so they compose with ``async with Database.transaction()``.
 """
 
 from __future__ import annotations
 
-import copy
+import functools
 from dataclasses import dataclass
-from typing import Any, Iterator, AsyncIterator, TYPE_CHECKING
+from typing import Any, AsyncIterator, Iterator, TYPE_CHECKING
 
-from .database import Database
+from .database import Database, athread, awrite
 from .exceptions import RecordNotFoundError, MultipleResultsError
 from .fields import ForeignKeyField
 from .sql import validate_identifier
@@ -23,7 +22,7 @@ if TYPE_CHECKING:
     from .model import Model, ReverseRelationDescriptor
 
 # ---------------------------------------------------------------------------
-# Lookup registry
+# Lookups
 # ---------------------------------------------------------------------------
 
 _LOOKUPS: dict[str, str] = {
@@ -39,6 +38,12 @@ _LOOKUPS: dict[str, str] = {
 
 _LIKE_ESCAPE_CHAR = "\\"
 
+_LIKE_PATTERNS: dict[str, str] = {
+    "contains": "%{v}%", "startswith": "{v}%", "endswith": "%{v}",
+    "icontains": "%{v}%", "istartswith": "{v}%", "iendswith": "%{v}",
+    "iexact": "{v}",
+}
+
 
 def _escape_like(value: str) -> str:
     """Escape ``%``, ``_``, and ``\\`` for LIKE patterns."""
@@ -48,17 +53,6 @@ def _escape_like(value: str) -> str:
         .replace("%", _LIKE_ESCAPE_CHAR + "%")
         .replace("_", _LIKE_ESCAPE_CHAR + "_")
     )
-
-
-def _parse_lookup(key: str) -> tuple[str, str]:
-    """Split ``'field__lookup'`` into ``('field', 'lookup')``.
-
-    If no double-underscore lookup is found the default ``'exact'`` is used.
-    """
-    parts = key.rsplit("__", 1)
-    if len(parts) == 2 and parts[1] in _LOOKUPS:
-        return parts[0], parts[1]
-    return key, "exact"
 
 
 # ===========================================================================
@@ -93,25 +87,62 @@ class Q:
         return self._combine(other, "OR")
 
     def __invert__(self) -> Q:
-        clone = copy.deepcopy(self)
-        clone.negated = not clone.negated
+        clone = Q()
+        clone.children = list(self.children)
+        clone.connector = self.connector
+        clone.negated = not self.negated
         return clone
 
 
 # ===========================================================================
-# Expression framework - F, Value, RawSQL, Func, aggregates, Subquery
+# Expressions - F, Value, RawSQL, Func, aggregates, Subquery
 # ===========================================================================
 
 class Expression:
-    """Base class for SQL expressions."""
+    """Base class for SQL expressions.  Supports arithmetic composition::
+
+        User.filter(score__gt=F("bonus") * 2)
+        Post.filter(id__in=[...]).update(views=F("views") + 1)
+    """
+
     is_aggregate: bool = False
 
     def as_sql(self, queryset: QuerySet) -> tuple[str, list[Any]]:
         raise NotImplementedError
 
+    def _combine(self, other: Any, op: str, reversed_: bool = False) -> CombinedExpression:
+        return CombinedExpression(other, op, self) if reversed_ else CombinedExpression(self, op, other)
+
+    def __add__(self, other: Any) -> CombinedExpression: return self._combine(other, "+")
+    def __radd__(self, other: Any) -> CombinedExpression: return self._combine(other, "+", True)
+    def __sub__(self, other: Any) -> CombinedExpression: return self._combine(other, "-")
+    def __rsub__(self, other: Any) -> CombinedExpression: return self._combine(other, "-", True)
+    def __mul__(self, other: Any) -> CombinedExpression: return self._combine(other, "*")
+    def __rmul__(self, other: Any) -> CombinedExpression: return self._combine(other, "*", True)
+    def __truediv__(self, other: Any) -> CombinedExpression: return self._combine(other, "/")
+    def __rtruediv__(self, other: Any) -> CombinedExpression: return self._combine(other, "/", True)
+    def __mod__(self, other: Any) -> CombinedExpression: return self._combine(other, "%")
+
+
+class CombinedExpression(Expression):
+    """Two expressions joined by an arithmetic operator."""
+
+    __slots__ = ("lhs", "op", "rhs")
+
+    def __init__(self, lhs: Any, op: str, rhs: Any) -> None:
+        self.lhs = lhs
+        self.op = op
+        self.rhs = rhs
+
+    def as_sql(self, queryset: QuerySet) -> tuple[str, list[Any]]:
+        lhs_sql, lhs_params = queryset._coerce_expression(self.lhs).as_sql(queryset)
+        rhs_sql, rhs_params = queryset._coerce_expression(self.rhs).as_sql(queryset)
+        return f"({lhs_sql} {self.op} {rhs_sql})", [*lhs_params, *rhs_params]
+
 
 class Value(Expression):
     """Wrap a literal Python value as an SQL parameter."""
+
     __slots__ = ("value",)
 
     def __init__(self, value: Any) -> None:
@@ -122,7 +153,8 @@ class Value(Expression):
 
 
 class F(Expression):
-    """Reference a model field (or joined field) by dotted path."""
+    """Reference a model field (or joined field) by ``__``-separated path."""
+
     __slots__ = ("field_path",)
 
     def __init__(self, field_path: str) -> None:
@@ -135,6 +167,7 @@ class F(Expression):
 
 class RawSQL(Expression):
     """Inject raw SQL with optional parameter bindings."""
+
     __slots__ = ("sql", "params")
 
     def __init__(self, sql: str, params: list[Any] | tuple[Any, ...] | None = None) -> None:
@@ -147,6 +180,7 @@ class RawSQL(Expression):
 
 class Func(Expression):
     """Call an SQL function with arguments."""
+
     __slots__ = ("name", "args", "is_aggregate")
 
     def __init__(self, name: str, *args: Any, is_aggregate: bool = False) -> None:
@@ -158,8 +192,7 @@ class Func(Expression):
         sql_parts: list[str] = []
         params: list[Any] = []
         for arg in self.args:
-            expr = queryset._coerce_expression(arg)
-            arg_sql, arg_params = expr.as_sql(queryset)
+            arg_sql, arg_params = queryset._coerce_expression(arg).as_sql(queryset)
             sql_parts.append(arg_sql)
             params.extend(arg_params)
         return f"{self.name}({', '.join(sql_parts)})", params
@@ -167,7 +200,7 @@ class Func(Expression):
 
 class Count(Func):
     def __init__(self, *args: Any) -> None:
-        super().__init__("COUNT", *args, is_aggregate=True)
+        super().__init__("COUNT", *(args or ("*",)), is_aggregate=True)
 
 
 class Sum(Func):
@@ -192,6 +225,7 @@ class Max(Func):
 
 class Subquery(Expression):
     """Embed another QuerySet as a subquery."""
+
     __slots__ = ("queryset", "field")
 
     def __init__(self, queryset: QuerySet, field: str | None = None) -> None:
@@ -204,8 +238,11 @@ class Subquery(Expression):
         return self.queryset._build_select(select_override=[column_sql], include_annotations=False)
 
 
+_STAR = RawSQL("*")
+
+
 # ===========================================================================
-# JoinSpec
+# QuerySet
 # ===========================================================================
 
 @dataclass(slots=True)
@@ -219,30 +256,11 @@ class _JoinSpec:
     sql: str
 
 
-# ===========================================================================
-# LIKE pattern dispatch
-# ===========================================================================
-
-_LIKE_PATTERNS: dict[str, tuple[str, str]] = {
-    "contains":    ("%{v}%", "LIKE"),
-    "startswith":  ("{v}%",  "LIKE"),
-    "endswith":    ("%{v}",  "LIKE"),
-    "icontains":   ("%{v}%", "LIKE"),
-    "istartswith": ("{v}%",  "LIKE"),
-    "iendswith":   ("%{v}",  "LIKE"),
-    "iexact":      ("{v}",   "LIKE"),
-}
-
-
-# ===========================================================================
-# QuerySet
-# ===========================================================================
-
 class QuerySet:
     """Lazy, chainable SQL query builder with sync and async APIs.
 
-    Every mutating method returns a **copy** so the original can be reused.
-    Async methods are prefixed with ``a`` (e.g. ``aall``, ``afirst``).
+    Every chaining method returns a **copy**, so partial queries can be
+    reused.  Async methods are prefixed with ``a`` (``aall``, ``afirst``).
     """
 
     def __init__(self, model_cls: type[Model]) -> None:
@@ -265,23 +283,60 @@ class QuerySet:
         self._only_fields: list[str] | None = None
         self._defer_fields: list[str] | None = None
         self._prefetch_relations: list[str] = []
+        self._raw_sql: str | None = None
+        self._raw_params: list[Any] = []
 
-    def __iter__(self) -> Iterator[Model]:
+    # ------------------------------------------------------------------
+    # Dunder protocol
+    # ------------------------------------------------------------------
+
+    def __iter__(self) -> Iterator[Any]:
+        if self._prefetch_relations:
+            return iter(self.all())
         return self.iterator()
 
-    async def __aiter__(self) -> AsyncIterator[Model]:
+    async def __aiter__(self) -> AsyncIterator[Any]:
+        if self._prefetch_relations:
+            for item in await self.aall():
+                yield item
+            return
         async for item in self.aiterator():
             yield item
 
-    def __len__(self):
+    def __len__(self) -> int:
         return self.count()
+
+    def __bool__(self) -> bool:
+        return self.exists()
+
+    def __getitem__(self, item: int | slice) -> Any:
+        """Support ``qs[i]`` and lazy ``qs[start:stop]`` slicing."""
+        if isinstance(item, slice):
+            if item.step is not None:
+                raise ValueError("QuerySet slicing does not support a step")
+            start = item.start or 0
+            if start < 0 or (item.stop is not None and item.stop < 0):
+                raise ValueError("QuerySet slicing does not support negative indexes")
+            qs = self._clone()
+            qs._offset_val = (self._offset_val or 0) + start if start else self._offset_val
+            if item.stop is not None:
+                qs._limit_val = max(0, item.stop - start)
+            return qs
+        if item < 0:
+            raise ValueError("QuerySet indexing does not support negative indexes")
+        qs = self._clone()
+        qs._offset_val = (self._offset_val or 0) + item
+        qs._limit_val = 1
+        results = qs.all()
+        if not results:
+            raise IndexError("QuerySet index out of range")
+        return results[0]
 
     def __repr__(self) -> str:
         sql, params = self._build_select()
         return f"<QuerySet sql={sql!r} params={params!r}>"
 
     def _clone(self) -> QuerySet:
-        """Shallow-copy the QuerySet for efficient chaining."""
         qs = QuerySet.__new__(QuerySet)
         qs.model_cls = self.model_cls
         qs._where_fragments = list(self._where_fragments)
@@ -302,10 +357,13 @@ class QuerySet:
         qs._only_fields = list(self._only_fields) if self._only_fields is not None else None
         qs._defer_fields = list(self._defer_fields) if self._defer_fields is not None else None
         qs._prefetch_relations = list(self._prefetch_relations)
-        if hasattr(self, "_raw_sql"):
-            qs._raw_sql = self._raw_sql
-            qs._raw_params = list(self._raw_params)
+        qs._raw_sql = self._raw_sql
+        qs._raw_params = list(self._raw_params)
         return qs
+
+    def _assert_composable(self, operation: str) -> None:
+        if self._raw_sql is not None:
+            raise ValueError(f"{operation} is not supported after a set operation (union/intersection/difference)")
 
     # ------------------------------------------------------------------
     # Filtering
@@ -319,26 +377,26 @@ class QuerySet:
             User.filter(name="Alice", age__gt=18)
             User.filter(Q(name="Alice") | Q(name="Bob"))
         """
+        self._assert_composable("filter()")
         qs = self._clone()
         if kwargs:
             conditions = (*conditions, Q(**kwargs))
         for condition in conditions:
             if not isinstance(condition, Q):
                 raise TypeError("filter() positional arguments must be Q objects")
-            sql, params = qs._compile_q(condition)
-            qs._where_fragments.append((sql, params))
+            qs._where_fragments.append(qs._compile_q(condition))
         return qs
 
     def exclude(self, *conditions: Q, **kwargs: Any) -> QuerySet:
         """Add negated ``WHERE`` conditions."""
+        self._assert_composable("exclude()")
         qs = self._clone()
         if kwargs:
             conditions = (*conditions, Q(**kwargs))
         for condition in conditions:
             if not isinstance(condition, Q):
                 raise TypeError("exclude() positional arguments must be Q objects")
-            sql, params = qs._compile_q(~condition)
-            qs._where_fragments.append((sql, params))
+            qs._where_fragments.append(qs._compile_q(~condition))
         return qs
 
     # ------------------------------------------------------------------
@@ -350,7 +408,8 @@ class QuerySet:
         for field_name in fields:
             direction = "DESC" if field_name.startswith("-") else "ASC"
             raw_name = field_name.lstrip("-")
-            if raw_name in qs._annotations:
+            if raw_name in qs._annotations or qs._raw_sql is not None:
+                validate_identifier(raw_name, kind="order field")
                 qs._order_fields.append(f"{raw_name} {direction}")
                 continue
             column_sql, _ = qs._resolve_field_reference(raw_name.split("__"))
@@ -382,7 +441,8 @@ class QuerySet:
         return qs
 
     def values(self, *fields: str) -> QuerySet:
-        """Return dicts of specified fields instead of model instances."""
+        """Return dicts of the given fields instead of model instances."""
+        self._assert_composable("values()")
         qs = self._clone()
         qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
         qs._values_mode = "dict"
@@ -390,9 +450,10 @@ class QuerySet:
         return qs
 
     def values_list(self, *fields: str, flat: bool = False) -> QuerySet:
-        """Return tuples (or flat list if ``flat=True``) of specified fields."""
+        """Return tuples (or a flat list when ``flat=True``) of the given fields."""
         if flat and len(fields) != 1:
             raise ValueError("flat=True requires exactly one field")
+        self._assert_composable("values_list()")
         qs = self._clone()
         qs._values_fields = list(fields) if fields else list(self.model_cls._fields.keys())
         qs._values_mode = "tuple"
@@ -400,13 +461,21 @@ class QuerySet:
         return qs
 
     def only(self, *fields: str) -> QuerySet:
-        """Load only the specified fields (plus the PK)."""
+        """Load only the given fields (plus the PK); others come back ``None``."""
+        self._assert_composable("only()")
+        unknown = [f for f in fields if f not in self.model_cls._fields]
+        if unknown:
+            raise ValueError(f"Unknown field(s) in only(): {unknown!r}")
         qs = self._clone()
         qs._only_fields = list(fields)
         return qs
 
     def defer(self, *fields: str) -> QuerySet:
-        """Defer loading of specified fields."""
+        """Skip loading the given fields; they come back ``None``."""
+        self._assert_composable("defer()")
+        unknown = [f for f in fields if f not in self.model_cls._fields]
+        if unknown:
+            raise ValueError(f"Unknown field(s) in defer(): {unknown!r}")
         qs = self._clone()
         qs._defer_fields = list(fields)
         return qs
@@ -417,12 +486,14 @@ class QuerySet:
 
     def join(self, relation_name: str, *, join_type: str = "INNER") -> QuerySet:
         """Explicitly join on a relation (forward FK or reverse)."""
+        self._assert_composable("join()")
         qs = self._clone()
         qs._ensure_join(tuple(relation_name.split("__")), join_type=join_type)
         return qs
 
     def select_related(self, *fk_fields: str) -> QuerySet:
-        """Eagerly join on ForeignKeyField columns and hydrate related objects."""
+        """Eagerly join on ForeignKeyFields and hydrate the related objects."""
+        self._assert_composable("select_related()")
         qs = self._clone()
         for fk_name in fk_fields:
             if "__" in fk_name:
@@ -430,40 +501,39 @@ class QuerySet:
             field_obj = qs.model_cls._fields.get(fk_name)
             if not isinstance(field_obj, ForeignKeyField):
                 raise ValueError(f"'{fk_name}' is not a ForeignKeyField")
-
             join_spec = qs._ensure_join((fk_name,), join_type="LEFT")
-            related_model = join_spec.related_model
             qs._selected_related[fk_name] = join_spec
-            for field in related_model._fields.values():
+            for field in join_spec.related_model._fields.values():
                 qs._select_fields.append(
                     f"{join_spec.alias}.{field.column_name} AS {fk_name}__{field.column_name}"
                 )
         return qs
 
     def prefetch_related(self, *relations: str) -> QuerySet:
-        """Batch-load reverse FK relations in separate queries.
+        """Batch-load reverse FK relations in one extra query per relation.
 
-        Unlike ``select_related`` (which uses JOINs), this issues a
-        separate query per relation, avoiding row duplication::
+        Unlike ``select_related`` (JOIN-based), this avoids row duplication.
+        Prefetched managers serve cached rows::
 
-            users = User.prefetch_related("post_set").all()
+            users = User.prefetch_related("posts").all()
             for user in users:
-                # user.post_set is pre-populated, no extra queries
-                print(user.post_set.all())
+                user.posts.all()   # no query
         """
+        self._assert_composable("prefetch_related()")
         qs = self._clone()
-        qs._prefetch_relations = list(set(qs._prefetch_relations + list(relations)))
+        qs._prefetch_relations = list(dict.fromkeys(qs._prefetch_relations + list(relations)))
         return qs
 
     # ------------------------------------------------------------------
-    # Annotations / Group By / Having
+    # Annotations / grouping
     # ------------------------------------------------------------------
 
     def annotate(self, **annotations: Any) -> QuerySet:
         """Add computed columns via expressions::
 
-            User.annotate(post_count=Count(F("post_set__id")))
+            User.annotate(post_count=Count("posts__id"))
         """
+        self._assert_composable("annotate()")
         qs = self._clone()
         for alias, expression in annotations.items():
             validate_identifier(alias, kind="annotation alias")
@@ -472,6 +542,7 @@ class QuerySet:
 
     def group_by(self, *fields: str) -> QuerySet:
         """Add explicit GROUP BY columns."""
+        self._assert_composable("group_by()")
         qs = self._clone()
         for field_name in fields:
             col, _ = qs._resolve_field_reference(field_name.split("__"))
@@ -480,14 +551,14 @@ class QuerySet:
 
     def having(self, *conditions: Q, **kwargs: Any) -> QuerySet:
         """Add HAVING conditions for filtered aggregates."""
+        self._assert_composable("having()")
         qs = self._clone()
         if kwargs:
             conditions = (*conditions, Q(**kwargs))
         for condition in conditions:
             if not isinstance(condition, Q):
                 raise TypeError("having() positional arguments must be Q objects")
-            sql, params = qs._compile_q(condition)
-            qs._having_fragments.append((sql, params))
+            qs._having_fragments.append(qs._compile_q(condition))
         return qs
 
     # ------------------------------------------------------------------
@@ -495,7 +566,7 @@ class QuerySet:
     # ------------------------------------------------------------------
 
     def union(self, other: QuerySet, *, all: bool = False) -> QuerySet:
-        """Combine with another QuerySet using UNION."""
+        """Combine with another QuerySet using UNION (or UNION ALL)."""
         return self._set_operation("UNION ALL" if all else "UNION", other)
 
     def intersection(self, other: QuerySet) -> QuerySet:
@@ -507,34 +578,14 @@ class QuerySet:
         return self._set_operation("EXCEPT", other)
 
     def _set_operation(self, op: str, other: QuerySet) -> QuerySet:
-        """Build a set-operation QuerySet wrapping two sub-selects."""
         left_sql, left_params = self._build_select()
         right_sql, right_params = other._build_select()
-        combined_sql = f"{left_sql} {op} {right_sql}"
-        combined_params = left_params + right_params
-        # Return a new QuerySet that wraps the combined SQL
-        qs = QuerySet.__new__(QuerySet)
-        qs.model_cls = self.model_cls
-        qs._where_fragments = []
-        qs._order_fields = []
-        qs._limit_val = None
-        qs._offset_val = None
-        qs._join_specs = []
-        qs._join_map = {}
-        qs._select_fields = [f"{self.model_cls.table_name}.*"]
-        qs._selected_related = {}
-        qs._annotations = {}
-        qs._distinct = False
-        qs._group_by_fields = []
-        qs._having_fragments = []
+        qs = QuerySet(self.model_cls)
         qs._values_fields = self._values_fields
         qs._values_mode = self._values_mode
         qs._values_flat = self._values_flat
-        qs._only_fields = None
-        qs._defer_fields = None
-        qs._prefetch_relations = []
-        qs._raw_sql = combined_sql
-        qs._raw_params = combined_params
+        qs._raw_sql = f"{left_sql} {op} {right_sql}"
+        qs._raw_params = left_params + right_params
         return qs
 
     # ------------------------------------------------------------------
@@ -542,33 +593,20 @@ class QuerySet:
     # ------------------------------------------------------------------
 
     def _get_select_columns(self) -> list[str]:
-        """Determine the SELECT column list based on only/defer/values."""
+        model = self.model_cls
+        table = model.table_name
         if self._only_fields is not None:
-            pk_name = self.model_cls._pk_name
-            field_names = set(self._only_fields) | {pk_name}
-            table = self.model_cls.table_name
-            return [
-                f"{table}.{self.model_cls._fields[n].column_name}"
-                for n in field_names
-                if n in self.model_cls._fields
-            ]
+            names = dict.fromkeys([*self._only_fields, model._pk_name])
+            return [f"{table}.{model._fields[n].column_name}" for n in names]
         if self._defer_fields is not None:
             deferred = set(self._defer_fields)
-            table = self.model_cls.table_name
-            return [
-                f"{table}.{f.column_name}"
-                for n, f in self.model_cls._fields.items()
-                if n not in deferred
-            ]
+            return [f"{table}.{f.column_name}" for n, f in model._fields.items() if n not in deferred]
         if self._values_fields is not None:
-            table = self.model_cls.table_name
             cols = []
             for name in self._values_fields:
-                if name in self.model_cls._fields:
-                    cols.append(f"{table}.{self.model_cls._fields[name].column_name}")
-                elif name in self._annotations:
-                    pass  # Will be added by annotation handling
-                else:
+                if name in model._fields:
+                    cols.append(f"{table}.{model._fields[name].column_name}")
+                elif name not in self._annotations:
                     raise ValueError(f"Unknown field or annotation {name!r}")
             return cols
         return list(self._select_fields)
@@ -579,67 +617,63 @@ class QuerySet:
         select_override: list[str] | None = None,
         include_annotations: bool = True,
     ) -> tuple[str, list[Any]]:
-        # Handle set-operation wrapped querysets
-        if hasattr(self, "_raw_sql"):
-            return self._raw_sql, self._raw_params
+        if self._raw_sql is not None:
+            sql, params = self._raw_sql, list(self._raw_params)
+            if self._order_fields:
+                sql += f" ORDER BY {', '.join(self._order_fields)}"
+            sql += self._limit_offset_sql()
+            return sql, params
 
         params: list[Any] = []
         select_parts = list(select_override or self._get_select_columns())
-
-        if include_annotations and self._annotations:
+        if include_annotations:
             for alias, expression in self._annotations.items():
                 expr_sql, expr_params = expression.as_sql(self)
                 select_parts.append(f"{expr_sql} AS {alias}")
                 params.extend(expr_params)
 
         distinct = "DISTINCT " if self._distinct else ""
-        parts = [
-            f"SELECT {distinct}{', '.join(select_parts)}",
-            "FROM",
-            self.model_cls.table_name,
-        ]
-        for join_spec in self._join_specs:
-            parts.append(join_spec.sql)
+        parts = [f"SELECT {distinct}{', '.join(select_parts)}", "FROM", self.model_cls.table_name]
+        parts.extend(join_spec.sql for join_spec in self._join_specs)
 
         if self._where_fragments:
-            parts.append("WHERE")
-            parts.append(" AND ".join(fragment for fragment, _ in self._where_fragments))
-            for _, fragment_params in self._where_fragments:
-                params.extend(fragment_params)
+            parts.append("WHERE " + " AND ".join(frag for frag, _ in self._where_fragments))
+            for _, frag_params in self._where_fragments:
+                params.extend(frag_params)
 
-        # GROUP BY
         group_by_cols = list(self._group_by_fields)
         if not group_by_cols and include_annotations and any(
             expr.is_aggregate for expr in self._annotations.values()
         ):
-            pk_col = self.model_cls._pk_field.column_name
-            group_by_cols.append(f"{self.model_cls.table_name}.{pk_col}")
+            group_by_cols.append(f"{self.model_cls.table_name}.{self.model_cls._pk_field.column_name}")
         if group_by_cols:
             parts.append(f"GROUP BY {', '.join(group_by_cols)}")
 
-        # HAVING
         if self._having_fragments:
-            parts.append("HAVING")
-            parts.append(" AND ".join(frag for frag, _ in self._having_fragments))
+            parts.append("HAVING " + " AND ".join(frag for frag, _ in self._having_fragments))
             for _, frag_params in self._having_fragments:
                 params.extend(frag_params)
 
         if self._order_fields:
             parts.append(f"ORDER BY {', '.join(self._order_fields)}")
+        return " ".join(parts) + self._limit_offset_sql(), params
+
+    def _limit_offset_sql(self) -> str:
+        sql = ""
         if self._limit_val is not None:
-            parts.append(f"LIMIT {self._limit_val}")
+            sql += f" LIMIT {self._limit_val}"
         elif self._offset_val is not None:
-            parts.append("LIMIT -1")
+            sql += " LIMIT -1"
         if self._offset_val is not None:
-            parts.append(f"OFFSET {self._offset_val}")
-        return " ".join(parts), params
+            sql += f" OFFSET {self._offset_val}"
+        return sql
 
     def as_sql(self) -> tuple[str, list[Any]]:
-        """Return the ``(sql, params)`` tuple without executing."""
+        """Return the ``(sql, params)`` pair without executing."""
         return self._build_select()
 
     def explain(self) -> str:
-        """Return the ``EXPLAIN QUERY PLAN`` output for debugging."""
+        """Return ``EXPLAIN QUERY PLAN`` output for debugging."""
         sql, params = self._build_select()
         rows = Database.fetchall(f"EXPLAIN QUERY PLAN {sql}", params)
         return "\n".join(
@@ -648,26 +682,14 @@ class QuerySet:
         )
 
     # ------------------------------------------------------------------
-    # Row -> instance conversion (with hydration + annotations)
+    # Row conversion
     # ------------------------------------------------------------------
 
     def _row_to_instance(self, row: Any) -> Model:
-        """Build a model instance from a DB row, hydrating related objects."""
         row_dict = dict(row)
+        annotations = {alias: row_dict[alias] for alias in self._annotations if alias in row_dict}
+        instance = self.model_cls._from_row(row_dict, annotations=annotations)
 
-        base_data = {
-            field.column_name: row_dict[field.column_name]
-            for field in self.model_cls._fields.values()
-            if field.column_name in row_dict
-        }
-        annotations = {
-            alias: row_dict[alias]
-            for alias in self._annotations
-            if alias in row_dict
-        }
-        instance = self.model_cls._from_row(base_data, annotations=annotations)
-
-        # Hydrate related objects from select_related
         for relation_name, join_spec in self._selected_related.items():
             related_row = {}
             for field in join_spec.related_model._fields.values():
@@ -679,48 +701,41 @@ class QuerySet:
             related_instance = join_spec.related_model._from_row(related_row)
             fk_field = self.model_cls._fields[relation_name]
             instance.__dict__[fk_field.cache_attr_name] = related_instance
-
         return instance
 
-    def _row_to_values(self, row: Any) -> dict[str, Any] | tuple | Any:
-        """Convert a row to a values dict/tuple/scalar based on _values_fields."""
+    def _row_to_values(self, row: Any) -> Any:
         row_dict = dict(row)
         fields = self._values_fields
-        if self._values_flat:
-            name = fields[0]
-            if name in self.model_cls._fields:
-                return row_dict.get(self.model_cls._fields[name].column_name)
+
+        def value_of(name: str) -> Any:
+            field = self.model_cls._fields.get(name)
+            if field is not None and field.column_name in row_dict:
+                return row_dict[field.column_name]
             return row_dict.get(name)
 
+        if self._values_flat:
+            return value_of(fields[0])
         if self._values_mode == "tuple":
-            values = []
-            for name in fields:
-                if name in self.model_cls._fields:
-                    col = self.model_cls._fields[name].column_name
-                    values.append(row_dict.get(col))
-                elif name in row_dict:
-                    values.append(row_dict[name])
-            return tuple(values)
+            return tuple(value_of(name) for name in fields)
+        return {name: value_of(name) for name in fields}
 
-        result = {}
-        for name in fields:
-            if name in self.model_cls._fields:
-                col = self.model_cls._fields[name].column_name
-                result[name] = row_dict.get(col)
-            elif name in row_dict:
-                result[name] = row_dict[name]
-        return result
+    def _converter(self) -> Any:
+        return self._row_to_values if self._values_fields is not None else self._row_to_instance
 
     # ------------------------------------------------------------------
-    # Materialisation
+    # Materialization
     # ------------------------------------------------------------------
 
     def all(self) -> list:
-        """Execute the query and return results."""
+        """Execute the query and return all results."""
         results = list(self.iterator())
         if self._prefetch_relations:
             self._do_prefetch(results)
         return results
+
+    async def aall(self) -> list:
+        """Async version of :meth:`all`."""
+        return await athread(self.all)
 
     def first(self) -> Any:
         """Return the first result or ``None``."""
@@ -728,244 +743,205 @@ class QuerySet:
             return item
         return None
 
+    async def afirst(self) -> Any:
+        """Async version of :meth:`first`."""
+        return await athread(self.first)
+
+    def last(self) -> Any:
+        """Return the last result (reversed ordering; PK order when unordered)."""
+        return self._reversed().first()
+
+    async def alast(self) -> Any:
+        """Async version of :meth:`last`."""
+        return await athread(self.last)
+
+    def _reversed(self) -> QuerySet:
+        qs = self._clone()
+        if qs._order_fields:
+            qs._order_fields = [
+                f"{f[:-4]} DESC" if f.endswith(" ASC") else f"{f[:-5]} ASC"
+                for f in qs._order_fields
+            ]
+            return qs
+        return qs.order_by(f"-{self.model_cls._pk_name}")
+
     def get(self, **kwargs: Any) -> Model:
-        """Return exactly one result.  Raises on 0 or >1 matches."""
+        """Return exactly one result; raises on zero or multiple matches."""
         qs = self.filter(**kwargs) if kwargs else self._clone()
-        results = list(qs.limit(2).iterator())
-        if len(results) == 0:
-            raise RecordNotFoundError(
-                f"No {self.model_cls.__name__} matches the given query"
-            )
+        qs._limit_val = 2
+        results = list(qs.iterator())
+        if not results:
+            raise RecordNotFoundError(f"No {self.model_cls.__name__} matches the given query")
         if len(results) > 1:
-            raise MultipleResultsError(
-                f"Expected 1 {self.model_cls.__name__}, got {len(results)}"
-            )
+            raise MultipleResultsError(f"Expected 1 {self.model_cls.__name__}, got multiple")
         return results[0]
+
+    async def aget(self, **kwargs: Any) -> Model:
+        """Async version of :meth:`get`."""
+        return await athread(functools.partial(self.get, **kwargs))
+
+    def latest(self, field: str | None = None) -> Model:
+        """Return the newest row by *field* (default: PK).  Raises if empty."""
+        name = field or self.model_cls._pk_name
+        result = self.order_by(f"-{name}").first()
+        if result is None:
+            raise RecordNotFoundError(f"No {self.model_cls.__name__} matches the given query")
+        return result
+
+    async def alatest(self, field: str | None = None) -> Model:
+        """Async version of :meth:`latest`."""
+        return await athread(self.latest, field)
+
+    def earliest(self, field: str | None = None) -> Model:
+        """Return the oldest row by *field* (default: PK).  Raises if empty."""
+        name = field or self.model_cls._pk_name
+        result = self.order_by(name).first()
+        if result is None:
+            raise RecordNotFoundError(f"No {self.model_cls.__name__} matches the given query")
+        return result
+
+    async def aearliest(self, field: str | None = None) -> Model:
+        """Async version of :meth:`earliest`."""
+        return await athread(self.earliest, field)
+
+    def in_bulk(self, values: Any = None, *, field: str | None = None) -> dict[Any, Model]:
+        """Return ``{key: instance}`` for the given key *values* (default: all rows).
+
+        *field* defaults to the primary key and must be unique per row.
+        """
+        name = field or self.model_cls._pk_name
+        qs = self.filter(**{f"{name}__in": list(values)}) if values is not None else self
+        return {instance.__dict__.get(name): instance for instance in qs.iterator()}
+
+    async def ain_bulk(self, values: Any = None, *, field: str | None = None) -> dict[Any, Model]:
+        """Async version of :meth:`in_bulk`."""
+        return await athread(functools.partial(self.in_bulk, values, field=field))
 
     # ------------------------------------------------------------------
     # Streaming iteration
     # ------------------------------------------------------------------
 
     def iterator(self, chunk_size: int = 2000) -> Iterator:
-        """Stream results row-by-row without materializing the full list."""
+        """Stream results without materializing the full list."""
         sql, params = self._build_select()
         cursor = Database.execute_read(sql, params)
-        converter = self._row_to_values if self._values_fields is not None else self._row_to_instance
+        converter = self._converter()
         while True:
             rows = cursor.fetchmany(chunk_size)
             if not rows:
-                break
+                return
             for row in rows:
                 yield converter(row)
 
     async def aiterator(self, chunk_size: int = 2000) -> AsyncIterator:
-        """Async streaming results."""
+        """Async streaming iteration (chunked fetches on a worker thread)."""
         sql, params = self._build_select()
-        cursor = await Database.aexecute_read(sql, params)
-        converter = self._row_to_values if self._values_fields is not None else self._row_to_instance
-        try:
-            while True:
-                rows = await cursor.fetchmany(chunk_size)
-                if not rows:
-                    break
-                for row in rows:
-                    yield converter(row)
-        finally:
-            await cursor.close()
+        cursor = await athread(Database.execute_read, sql, params)
+        converter = self._converter()
+        while True:
+            rows = await athread(cursor.fetchmany, chunk_size)
+            if not rows:
+                return
+            for row in rows:
+                yield converter(row)
 
     # ------------------------------------------------------------------
     # Aggregation
     # ------------------------------------------------------------------
 
     def count(self) -> int:
-        """Return the count of matching rows."""
+        """Return the number of matching rows."""
         sql, params = self._build_select()
-        count_sql = f"SELECT COUNT(*) AS cnt FROM ({sql})"
-        return int(Database.fetch_value(count_sql, params, column="cnt") or 0)
+        return int(Database.fetch_value(f"SELECT COUNT(*) AS cnt FROM ({sql})", params, column="cnt") or 0)
+
+    async def acount(self) -> int:
+        """Async version of :meth:`count`."""
+        return await athread(self.count)
 
     def exists(self) -> bool:
-        """Return ``True`` if at least one row matches.
-
-        Uses ``SELECT 1 ... LIMIT 1`` for efficiency.
-        """
+        """Return ``True`` if at least one row matches (``SELECT 1 ... LIMIT 1``)."""
         sql, params = self._build_select()
-        row = Database.fetchone(f"SELECT 1 FROM ({sql}) LIMIT 1", params)
-        return row is not None
+        return Database.fetchone(f"SELECT 1 FROM ({sql}) LIMIT 1", params) is not None
+
+    async def aexists(self) -> bool:
+        """Async version of :meth:`exists`."""
+        return await athread(self.exists)
 
     def aggregate(self, func: str, field: str) -> Any:
-        """Run an aggregate function (SUM, AVG, MIN, MAX, COUNT)."""
+        """Run an aggregate function (SUM, AVG, MIN, MAX, COUNT) over *field*."""
         func = func.upper()
         if func not in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
             raise ValueError(f"Unsupported aggregate function: {func}")
         col, _ = self._resolve_field_reference(field.split("__"))
-        base_sql, params = self._build_select(
-            select_override=[f"{col} AS __agg_target__"],
-            include_annotations=False,
+        base_sql, params = self._build_select(select_override=[f"{col} AS __agg_target__"], include_annotations=False)
+        return Database.fetch_value(
+            f"SELECT {func}(__agg_target__) AS result FROM ({base_sql})", params, column="result"
         )
-        agg_sql = f"SELECT {func}(__agg_target__) AS result FROM ({base_sql})"
-        return Database.fetch_value(agg_sql, params, column="result")
+
+    async def aaggregate(self, func: str, field: str) -> Any:
+        """Async version of :meth:`aggregate`."""
+        return await athread(self.aggregate, func, field)
 
     # ------------------------------------------------------------------
     # Pagination
     # ------------------------------------------------------------------
 
     def paginate(self, *, page: int = 1, per_page: int = 20) -> Any:
-        """Return an offset-based :class:`~obele.orm.pagination.Page`.
-
-        Args:
-            page: Page number (1-indexed).
-            per_page: Number of items per page.
-        """
+        """Return an offset-based :class:`~obele.orm.pagination.Page`."""
         from .pagination import paginate_queryset
         return paginate_queryset(self, page=page, per_page=per_page)
 
     async def apaginate(self, *, page: int = 1, per_page: int = 20) -> Any:
         """Async version of :meth:`paginate`."""
-        from .pagination import apaginate_queryset
-        return await apaginate_queryset(self, page=page, per_page=per_page)
+        return await athread(functools.partial(self.paginate, page=page, per_page=per_page))
 
     def cursor_paginate(
-        self,
-        *,
-        per_page: int = 20,
-        cursor_field: str = "",
-        after: Any = None,
-        before: Any = None,
+        self, *, per_page: int = 20, cursor_field: str = "", after: Any = None, before: Any = None,
     ) -> Any:
-        """Return a cursor-based :class:`~obele.orm.pagination.CursorPage`.
-
-        The queryset should have an ``order_by`` applied.
-        """
+        """Return a cursor-based :class:`~obele.orm.pagination.CursorPage`."""
         from .pagination import cursor_paginate_queryset
-        return cursor_paginate_queryset(
-            self,
-            per_page=per_page,
-            cursor_field=cursor_field,
-            after=after,
-            before=before,
-        )
+        return cursor_paginate_queryset(self, per_page=per_page, cursor_field=cursor_field, after=after, before=before)
 
-    async def acursor_paginate(
-        self,
-        *,
-        per_page: int = 20,
-        cursor_field: str = "",
-        after: Any = None,
-        before: Any = None,
-    ) -> Any:
+    async def acursor_paginate(self, **kwargs: Any) -> Any:
         """Async version of :meth:`cursor_paginate`."""
-        from .pagination import acursor_paginate_queryset
-        return await acursor_paginate_queryset(
-            self,
-            per_page=per_page,
-            cursor_field=cursor_field,
-            after=after,
-            before=before,
-        )
+        return await athread(functools.partial(self.cursor_paginate, **kwargs))
 
     # ------------------------------------------------------------------
-    # Prefetch support
+    # Prefetch
     # ------------------------------------------------------------------
 
     def _do_prefetch(self, instances: list) -> None:
-        """Execute prefetch queries and attach results to instances."""
         if not instances:
             return
-
-        from .model import ReverseRelationDescriptor
-
         for relation_name in self._prefetch_relations:
-            # Look up the reverse relation descriptor
-            reverse_relations: dict = getattr(
-                self.model_cls, "_reverse_relations", {},
-            )
-            descriptor = reverse_relations.get(relation_name)
+            descriptor = getattr(self.model_cls, "_reverse_relations", {}).get(relation_name)
             if descriptor is None:
                 raise ValueError(
-                    f"'{relation_name}' is not a known reverse relation on "
-                    f"{self.model_cls.__name__}"
+                    f"'{relation_name}' is not a known reverse relation on {self.model_cls.__name__}"
                 )
-
-            related_model = descriptor.related_model
             fk_field_name = descriptor.field_name
-            fk_field = related_model._fields[fk_field_name]
-
-            # Collect all PKs
-            pk_values = [
-                inst.__dict__.get(inst._pk_name)
-                for inst in instances
-                if inst.__dict__.get(inst._pk_name) is not None
-            ]
+            pk_values = [inst.pk for inst in instances if inst.pk is not None]
             if not pk_values:
                 continue
-
-            # Batch query: SELECT * FROM related WHERE fk_col IN (...)
-            related_items = related_model.filter(
-                **{f"{fk_field_name}__in": pk_values}
-            ).all()
-
-            # Group by FK value
+            related_items = descriptor.related_model.filter(**{f"{fk_field_name}__in": pk_values}).all()
             grouped: dict[Any, list] = {}
             for item in related_items:
-                fk_val = item.__dict__.get(fk_field_name)
-                grouped.setdefault(fk_val, []).append(item)
-
-            # Attach to instances via a prefetch cache
+                grouped.setdefault(item.__dict__.get(fk_field_name), []).append(item)
             for inst in instances:
-                pk = inst.__dict__.get(inst._pk_name)
-                items = grouped.get(pk, [])
-                # Store as a prefetch cache attribute
-                cache_key = f"_prefetch_{relation_name}"
-                inst.__dict__[cache_key] = items
-
-    async def _ado_prefetch(self, instances: list) -> None:
-        """Async version of :meth:`_do_prefetch`."""
-        if not instances:
-            return
-
-        for relation_name in self._prefetch_relations:
-            reverse_relations: dict = getattr(
-                self.model_cls, "_reverse_relations", {},
-            )
-            descriptor = reverse_relations.get(relation_name)
-            if descriptor is None:
-                raise ValueError(
-                    f"'{relation_name}' is not a known reverse relation on "
-                    f"{self.model_cls.__name__}"
-                )
-
-            related_model = descriptor.related_model
-            fk_field_name = descriptor.field_name
-            pk_values = [
-                inst.__dict__.get(inst._pk_name)
-                for inst in instances
-                if inst.__dict__.get(inst._pk_name) is not None
-            ]
-            if not pk_values:
-                continue
-
-            related_items = await related_model.filter(
-                **{f"{fk_field_name}__in": pk_values}
-            ).aall()
-
-            grouped: dict[Any, list] = {}
-            for item in related_items:
-                fk_val = item.__dict__.get(fk_field_name)
-                grouped.setdefault(fk_val, []).append(item)
-
-            for inst in instances:
-                pk = inst.__dict__.get(inst._pk_name)
-                cache_key = f"_prefetch_{relation_name}"
-                inst.__dict__[cache_key] = grouped.get(pk, [])
+                inst.__dict__[f"_prefetch_{relation_name}"] = grouped.get(inst.pk, [])
 
     # ------------------------------------------------------------------
-    # Bulk write operations
+    # Bulk writes
     # ------------------------------------------------------------------
 
     def update(self, *, validate: bool = True, **kwargs: Any) -> int:
-        """Bulk UPDATE matching rows.  Returns number of rows affected."""
+        """Bulk UPDATE matching rows; supports expressions.  Returns affected count::
+
+            Post.filter(id=pk).update(views=F("views") + 1)
+        """
         if not kwargs:
             raise ValueError("update() requires at least one field")
+        self._assert_composable("update()")
         if self._join_specs:
             raise ValueError("update() does not support joined filters")
         set_parts: list[str] = []
@@ -973,135 +949,54 @@ class QuerySet:
         for key, value in kwargs.items():
             field_obj = self.model_cls._fields.get(key)
             col = field_obj.column_name if field_obj else key
+            if isinstance(value, (Expression, QuerySet)):
+                expr_sql, expr_params = self._coerce_expression(value).as_sql(self)
+                set_parts.append(f"{col} = {expr_sql}")
+                set_params.extend(expr_params)
+                continue
             if validate and field_obj:
                 field_obj.validate(value)
-            db_val = field_obj.to_db(value) if field_obj else value
             set_parts.append(f"{col} = ?")
-            set_params.append(db_val)
+            set_params.append(field_obj.to_db(value) if field_obj else value)
+        if self._join_specs:
+            raise ValueError("update() expressions cannot reference joined relations")
 
         sql = f"UPDATE {self.model_cls.table_name} SET {', '.join(set_parts)}"
         where_params: list[Any] = []
         if self._where_fragments:
             sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
-            for _, fp in self._where_fragments:
-                where_params.extend(fp)
-        cursor = Database.execute(sql, set_params + where_params)
-        return cursor.rowcount
-
-    def delete(self) -> int:
-        """Bulk DELETE matching rows.  Returns number of rows affected."""
-        if self._join_specs:
-            raise ValueError("delete() does not support joined filters")
-        sql = f"DELETE FROM {self.model_cls.table_name}"
-        params: list[Any] = []
-        if self._where_fragments:
-            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
-            for _, fp in self._where_fragments:
-                params.extend(fp)
-        cursor = Database.execute(sql, params)
-        return cursor.rowcount
-
-    # ------------------------------------------------------------------
-    # Async variants
-    # ------------------------------------------------------------------
-
-    async def aall(self) -> list:
-        results = [item async for item in self.aiterator()]
-        if self._prefetch_relations:
-            await self._ado_prefetch(results)
-        return results
-
-    async def afirst(self) -> Any:
-        async for item in self.limit(1).aiterator():
-            return item
-        return None
-
-    async def aget(self, **kwargs: Any) -> Model:
-        qs = self.filter(**kwargs) if kwargs else self._clone()
-        results = [item async for item in qs.limit(2).aiterator()]
-        if len(results) == 0:
-            raise RecordNotFoundError(
-                f"No {self.model_cls.__name__} matches the given query"
-            )
-        if len(results) > 1:
-            raise MultipleResultsError(
-                f"Expected 1 {self.model_cls.__name__}, got {len(results)}"
-            )
-        return results[0]
-
-    async def acount(self) -> int:
-        sql, params = self._build_select()
-        count_sql = f"SELECT COUNT(*) AS cnt FROM ({sql})"
-        return int(await Database.afetch_value(count_sql, params, column="cnt") or 0)
-
-    async def aexists(self) -> bool:
-        sql, params = self._build_select()
-        row = await Database.afetchone(f"SELECT 1 FROM ({sql}) LIMIT 1", params)
-        return row is not None
-
-    async def aaggregate(self, func: str, field: str) -> Any:
-        func = func.upper()
-        if func not in ("SUM", "AVG", "MIN", "MAX", "COUNT"):
-            raise ValueError(f"Unsupported aggregate function: {func}")
-        col, _ = self._resolve_field_reference(field.split("__"))
-        base_sql, params = self._build_select(
-            select_override=[f"{col} AS __agg_target__"],
-            include_annotations=False,
-        )
-        agg_sql = f"SELECT {func}(__agg_target__) AS result FROM ({base_sql})"
-        return await Database.afetch_value(agg_sql, params, column="result")
+            for _, frag_params in self._where_fragments:
+                where_params.extend(frag_params)
+        return Database.execute(sql, set_params + where_params).rowcount
 
     async def aupdate(self, *, validate: bool = True, **kwargs: Any) -> int:
-        if not kwargs:
-            raise ValueError("update() requires at least one field")
-        if self._join_specs:
-            raise ValueError("update() does not support joined filters")
-        set_parts: list[str] = []
-        set_params: list[Any] = []
-        for key, value in kwargs.items():
-            field_obj = self.model_cls._fields.get(key)
-            col = field_obj.column_name if field_obj else key
-            if validate and field_obj:
-                field_obj.validate(value)
-            db_val = field_obj.to_db(value) if field_obj else value
-            set_parts.append(f"{col} = ?")
-            set_params.append(db_val)
+        """Async version of :meth:`update`."""
+        return await awrite(functools.partial(self.update, validate=validate, **kwargs))
 
-        sql = f"UPDATE {self.model_cls.table_name} SET {', '.join(set_parts)}"
-        where_params: list[Any] = []
-        if self._where_fragments:
-            sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
-            for _, fp in self._where_fragments:
-                where_params.extend(fp)
-        cursor = await Database.aexecute(sql, set_params + where_params)
-        try:
-            return cursor.rowcount
-        finally:
-            await cursor.close()
-
-    async def adelete(self) -> int:
+    def delete(self) -> int:
+        """Bulk DELETE matching rows.  Returns the number of rows removed."""
+        self._assert_composable("delete()")
         if self._join_specs:
             raise ValueError("delete() does not support joined filters")
         sql = f"DELETE FROM {self.model_cls.table_name}"
         params: list[Any] = []
         if self._where_fragments:
             sql += " WHERE " + " AND ".join(frag for frag, _ in self._where_fragments)
-            for _, fp in self._where_fragments:
-                params.extend(fp)
-        cursor = await Database.aexecute(sql, params)
-        try:
-            return cursor.rowcount
-        finally:
-            await cursor.close()
+            for _, frag_params in self._where_fragments:
+                params.extend(frag_params)
+        return Database.execute(sql, params).rowcount
+
+    async def adelete(self) -> int:
+        """Async version of :meth:`delete`."""
+        return await awrite(self.delete)
 
     # ------------------------------------------------------------------
     # Internal: Q compilation
     # ------------------------------------------------------------------
 
     def _split_lookup(self, key: str) -> tuple[list[str], str]:
-        """Split a key into field path parts and lookup name."""
         parts = key.split("__")
-        if parts[-1] in _LOOKUPS:
+        if len(parts) > 1 and parts[-1] in _LOOKUPS:
             return parts[:-1], parts[-1]
         return parts, "exact"
 
@@ -1116,64 +1011,50 @@ class QuerySet:
             compiled_children.append(f"({child_sql})")
             params.extend(child_params)
 
-        if not compiled_children:
-            compiled_sql = "1=1"
-        else:
-            compiled_sql = f" {expression.connector} ".join(compiled_children)
+        compiled_sql = f" {expression.connector} ".join(compiled_children) if compiled_children else "1=1"
         if expression.negated:
             compiled_sql = f"NOT ({compiled_sql})"
         return compiled_sql, params
 
     def _compile_condition(self, key: str, value: Any) -> tuple[str, list[Any]]:
-        """Compile a single lookup condition into SQL and params."""
         field_parts, lookup = self._split_lookup(key)
-        # Check if this references an annotation alias first
         if len(field_parts) == 1 and field_parts[0] in self._annotations:
             column_sql = field_parts[0]
             field_obj = None
         else:
             column_sql, field_obj = self._resolve_field_reference(field_parts)
 
-        # Dispatch to specialized handlers
         handler = _LOOKUP_DISPATCH.get(lookup)
         if handler is not None:
             return handler(self, column_sql, field_obj, value)
 
-        # LIKE-pattern lookups (contains, startswith, endswith + i-variants)
         if lookup in _LIKE_PATTERNS:
             return self._compile_like(column_sql, lookup, value)
 
-        if value is None and lookup in {"exact", "ne"}:
-            return (f"{column_sql} IS {'NOT ' if lookup == 'ne' else ''}NULL", [])
+        if value is None and lookup in ("exact", "ne"):
+            return f"{column_sql} IS {'NOT ' if lookup == 'ne' else ''}NULL", []
 
-        # Expression-based values
         if isinstance(value, QuerySet):
             value = Subquery(value)
         if isinstance(value, Subquery):
             sub_sql, sub_params = value.as_sql(self)
-            operator = _LOOKUPS[lookup].replace("?", f"({sub_sql})")
-            return f"{column_sql} {operator}", sub_params
+            return f"{column_sql} {_LOOKUPS[lookup].replace('?', f'({sub_sql})')}", sub_params
         if isinstance(value, Expression):
             expr_sql, expr_params = value.as_sql(self)
-            operator = _LOOKUPS[lookup].replace("?", expr_sql)
-            return f"{column_sql} {operator}", expr_params
+            return f"{column_sql} {_LOOKUPS[lookup].replace('?', expr_sql)}", expr_params
 
-        # Standard single-value lookups
         db_val = field_obj.to_db(value) if field_obj else value
         return f"{column_sql} {_LOOKUPS[lookup]}", [db_val]
 
     @staticmethod
     def _compile_like(column_sql: str, lookup: str, value: Any) -> tuple[str, list[Any]]:
-        """Compile a LIKE-pattern lookup."""
-        pattern_template, _ = _LIKE_PATTERNS[lookup]
-        escaped = _escape_like(str(value))
-        pattern = pattern_template.replace("{v}", escaped)
+        pattern = _LIKE_PATTERNS[lookup].replace("{v}", _escape_like(str(value)))
         if lookup.startswith("i"):
             return f"LOWER({column_sql}) LIKE ? ESCAPE '\\'", [pattern.lower()]
         return f"{column_sql} LIKE ? ESCAPE '\\'", [pattern]
 
     # ------------------------------------------------------------------
-    # Internal: expression coercion
+    # Internal: expression coercion, joins
     # ------------------------------------------------------------------
 
     def _coerce_expression(self, value: Any) -> Expression:
@@ -1181,23 +1062,21 @@ class QuerySet:
             return value
         if isinstance(value, QuerySet):
             return Subquery(value)
-        if isinstance(value, str) and "__" in value:
-            return F(value)
+        if isinstance(value, str):
+            if value == "*":
+                return _STAR
+            if "__" in value or value in self.model_cls._fields:
+                return F(value)
         return Value(value)
 
-    # ------------------------------------------------------------------
-    # Internal: field reference resolution & join management
-    # ------------------------------------------------------------------
-
     def _resolve_field_reference(self, path_parts: list[str]) -> tuple[str, Any]:
-        """Resolve a dotted field path to ``(table.column_sql, field_obj)``."""
+        """Resolve a ``__``-separated path to ``(table.column, field_obj)``."""
         if not path_parts:
             raise ValueError("field path cannot be empty")
 
         current_model = self.model_cls
         current_alias = self.model_cls.table_name
-
-        for idx, segment in enumerate(path_parts[:-1], start=1):
+        for idx in range(1, len(path_parts)):
             join_spec = self._ensure_join(tuple(path_parts[:idx]), join_type="LEFT")
             current_model = join_spec.related_model
             current_alias = join_spec.alias
@@ -1225,16 +1104,14 @@ class QuerySet:
         relation_name = path[-1]
         alias = f"jt{len(self._join_specs)}"
 
-        # Forward FK join
         if relation_name in parent_model._fields:
             field_obj = parent_model._fields[relation_name]
             if not isinstance(field_obj, ForeignKeyField):
                 raise ValueError(f"'{relation_name}' is not a joinable ForeignKeyField")
             related_model = field_obj.related_model
-            related_pk = related_model._pk_field.column_name
             sql = (
                 f"{join_type} JOIN {related_model.table_name} AS {alias} "
-                f"ON {parent_alias}.{field_obj.column_name} = {alias}.{related_pk}"
+                f"ON {parent_alias}.{field_obj.column_name} = {alias}.{related_model._pk_field.column_name}"
             )
             join_spec = _JoinSpec(
                 path=path, alias=alias, related_model=related_model,
@@ -1242,21 +1119,16 @@ class QuerySet:
                 relation_field_name=relation_name, sql=sql,
             )
         else:
-            # Reverse relation join
-            reverse_relations: dict[str, ReverseRelationDescriptor] = getattr(
+            descriptor: ReverseRelationDescriptor | None = getattr(
                 parent_model, "_reverse_relations", {},
-            )
-            descriptor = reverse_relations.get(relation_name)
+            ).get(relation_name)
             if descriptor is None:
-                raise ValueError(
-                    f"'{relation_name}' is not a joinable relation on {parent_model.__name__}"
-                )
+                raise ValueError(f"'{relation_name}' is not a joinable relation on {parent_model.__name__}")
             related_model = descriptor.related_model
             fk_field = related_model._fields[descriptor.field_name]
-            parent_pk = parent_model._pk_field.column_name
             sql = (
                 f"{join_type} JOIN {related_model.table_name} AS {alias} "
-                f"ON {alias}.{fk_field.column_name} = {parent_alias}.{parent_pk}"
+                f"ON {alias}.{fk_field.column_name} = {parent_alias}.{parent_model._pk_field.column_name}"
             )
             join_spec = _JoinSpec(
                 path=path, alias=alias, related_model=related_model,
@@ -1270,7 +1142,7 @@ class QuerySet:
 
 
 # ===========================================================================
-# Lookup dispatch table
+# Lookup dispatch
 # ===========================================================================
 
 def _compile_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
@@ -1279,9 +1151,7 @@ def _compile_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str
     if isinstance(value, Subquery):
         sub_sql, sub_params = value.as_sql(qs)
         return f"{col} IN ({sub_sql})", sub_params
-    if not isinstance(value, (list, tuple, set)):
-        value = [value]
-    values = list(value)
+    values = list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
     if not values:
         return "0=1", []
     placeholders = ", ".join("?" for _ in values)
@@ -1290,9 +1160,7 @@ def _compile_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str
 
 
 def _compile_not_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
-    if not isinstance(value, (list, tuple, set)):
-        value = [value]
-    values = list(value)
+    values = list(value) if isinstance(value, (list, tuple, set, frozenset)) else [value]
     if not values:
         return "1=1", []
     placeholders = ", ".join("?" for _ in values)
@@ -1301,7 +1169,7 @@ def _compile_not_in(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple
 
 
 def _compile_is_null(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
-    return (f"{col} {'IS NULL' if value else 'IS NOT NULL'}", [])
+    return f"{col} {'IS NULL' if value else 'IS NOT NULL'}", []
 
 
 def _compile_between(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tuple[str, list[Any]]:
@@ -1309,8 +1177,7 @@ def _compile_between(qs: QuerySet, col: str, field_obj: Any, value: Any) -> tupl
         raise ValueError("'between' lookup requires a 2-element tuple/list")
     lo, hi = value
     if field_obj:
-        lo = field_obj.to_db(lo)
-        hi = field_obj.to_db(hi)
+        lo, hi = field_obj.to_db(lo), field_obj.to_db(hi)
     return f"{col} BETWEEN ? AND ?", [lo, hi]
 
 

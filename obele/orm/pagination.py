@@ -1,52 +1,26 @@
 """Pagination utilities for QuerySet results.
 
-Provides :class:`Page` and :class:`CursorPage` for offset-based and
-cursor-based pagination::
+Offset-based and cursor-based pagination::
 
-    # Offset-based
     page = User.order_by("name").paginate(page=2, per_page=25)
-    page.items       # list[Model]
-    page.total       # total matching rows
-    page.pages       # total number of pages
-    page.has_next    # bool
-    page.has_prev    # bool
+    page.items, page.total, page.pages, page.has_next, page.has_prev
 
-    # Cursor-based (efficient for large datasets)
     page = User.order_by("id").cursor_paginate(per_page=25)
-    next_page = User.order_by("id").cursor_paginate(per_page=25, after=page.end_cursor)
+    nxt  = User.order_by("id").cursor_paginate(per_page=25, after=page.end_cursor)
+
+Async versions live on the QuerySet (``apaginate`` / ``acursor_paginate``).
 """
 
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from typing import Any, TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from .model import Model
+from typing import Any
 
 
 @dataclass(frozen=True, slots=True)
 class Page:
-    """Result of offset-based pagination.
-
-    Attributes
-    ----------
-    items:
-        The rows for the current page.
-    page:
-        Current page number (1-indexed).
-    per_page:
-        Maximum items per page.
-    total:
-        Total number of matching rows across all pages.
-    pages:
-        Total number of pages.
-    has_next:
-        ``True`` if there is a page after this one.
-    has_prev:
-        ``True`` if there is a page before this one.
-    """
+    """Result of offset-based pagination."""
 
     items: list[Any]
     page: int
@@ -68,23 +42,7 @@ class Page:
 
 @dataclass(frozen=True, slots=True)
 class CursorPage:
-    """Result of cursor-based pagination.
-
-    Attributes
-    ----------
-    items:
-        The rows for the current page.
-    per_page:
-        Maximum items per page.
-    has_next:
-        ``True`` if there are more items after this page.
-    has_prev:
-        ``True`` if there are items before this page.
-    start_cursor:
-        Cursor pointing to the first item (use as ``before``).
-    end_cursor:
-        Cursor pointing to the last item (use as ``after``).
-    """
+    """Result of cursor-based pagination."""
 
     items: list[Any]
     per_page: int
@@ -104,16 +62,7 @@ class CursorPage:
 
 
 def paginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Page:
-    """Execute an offset-based pagination on *queryset*.
-
-    Args:
-        queryset: A :class:`~obele.orm.query.QuerySet` instance.
-        page: Page number (1-indexed).
-        per_page: Number of items per page.
-
-    Returns:
-        A :class:`Page` with results and metadata.
-    """
+    """Offset-based pagination over *queryset* (1-indexed pages)."""
     if page < 1:
         raise ValueError("page must be >= 1")
     if per_page < 1:
@@ -121,112 +70,47 @@ def paginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Pa
 
     total = queryset.count()
     pages = max(1, math.ceil(total / per_page))
-    offset = (page - 1) * per_page
-    items = queryset.offset(offset).limit(per_page).all()
-
-    return Page(items=items, page=page, per_page=per_page, total=total, pages=pages, has_next=page < pages, has_prev=page > 1)
-
-
-async def apaginate_queryset(queryset: Any, *, page: int = 1, per_page: int = 20) -> Page:
-    """Async version of :func:`paginate_queryset`."""
-    if page < 1:
-        raise ValueError("page must be >= 1")
-    if per_page < 1:
-        raise ValueError("per_page must be >= 1")
-
-    total = await queryset.acount()
-    pages = max(1, math.ceil(total / per_page))
-    offset = (page - 1) * per_page
-    items = await queryset.offset(offset).limit(per_page).aall()
-
+    items = queryset.offset((page - 1) * per_page).limit(per_page).all()
     return Page(
-        items=items,
-        page=page,
-        per_page=per_page,
-        total=total,
-        pages=pages,
-        has_next=page < pages,
-        has_prev=page > 1,
+        items=items, page=page, per_page=per_page, total=total, pages=pages,
+        has_next=page < pages, has_prev=page > 1,
     )
 
 
-def cursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
-                             before: Any = None,) -> CursorPage:
-    """Execute cursor-based pagination on *queryset*.
+def cursor_paginate_queryset(
+    queryset: Any,
+    *,
+    per_page: int = 20,
+    cursor_field: str = "",
+    after: Any = None,
+    before: Any = None,
+) -> CursorPage:
+    """Cursor-based pagination; efficient for large datasets.
 
-    The queryset **must** have an ``order_by`` applied. The cursor field
-    defaults to the model's primary key.
-
-    Args:
-        queryset: A :class:`~obele.orm.query.QuerySet` instance.
-        per_page: Number of items per page.
-        cursor_field: Field name to use as cursor. Defaults to PK.
-        after: Fetch items after this cursor value.
-        before: Fetch items before this cursor value.
-
-    Returns:
-        A :class:`CursorPage` with results and navigation cursors.
+    The queryset should be ordered by *cursor_field* (default: the PK).
     """
     if per_page < 1:
         raise ValueError("per_page must be >= 1")
 
     field = cursor_field or queryset.model_cls._pk_name
-
     if after is not None:
         queryset = queryset.filter(**{f"{field}__gt": after})
     elif before is not None:
         queryset = queryset.filter(**{f"{field}__lt": before})
 
-    # Fetch one extra to determine has_next
     items = queryset.limit(per_page + 1).all()
     has_next = len(items) > per_page
     if has_next:
         items = items[:per_page]
 
-    has_prev = after is not None or before is not None
-    start = getattr(items[0], field, None) if items else None
-    end = getattr(items[-1], field, None) if items else None
-
-    return CursorPage(items=items, per_page=per_page, has_next=has_next, has_prev=has_prev, start_cursor=start, end_cursor=end,)
-
-
-async def acursor_paginate_queryset(queryset: Any, *, per_page: int = 20, cursor_field: str = "", after: Any = None,
-                                    before: Any = None,) -> CursorPage:
-    """Async version of :func:`cursor_paginate_queryset`."""
-    if per_page < 1:
-        raise ValueError("per_page must be >= 1")
-
-    field = cursor_field or queryset.model_cls._pk_name
-
-    if after is not None:
-        queryset = queryset.filter(**{f"{field}__gt": after})
-    elif before is not None:
-        queryset = queryset.filter(**{f"{field}__lt": before})
-
-    items = await queryset.limit(per_page + 1).aall()
-    has_next = len(items) > per_page
-    if has_next:
-        items = items[:per_page]
-
-    has_prev = after is not None or before is not None
-    start = getattr(items[0], field, None) if items else None
-    end = getattr(items[-1], field, None) if items else None
-
     return CursorPage(
         items=items,
         per_page=per_page,
         has_next=has_next,
-        has_prev=has_prev,
-        start_cursor=start,
-        end_cursor=end,
+        has_prev=after is not None or before is not None,
+        start_cursor=getattr(items[0], field, None) if items else None,
+        end_cursor=getattr(items[-1], field, None) if items else None,
     )
 
 
-__all__ = [
-    "Page",
-    "CursorPage",
-    "paginate_queryset",
-    "apaginate_queryset",
-    "cursor_paginate_queryset",
-    "acursor_paginate_queryset",
-]
+__all__ = ["Page", "CursorPage", "paginate_queryset", "cursor_paginate_queryset"]

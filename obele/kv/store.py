@@ -1,10 +1,10 @@
-"""Single-table key-value storage built on top of :mod:`obele.orm.database`.
+"""Single-table key-value storage built on :mod:`obele.orm.database`.
 
-Provides :class:`KVStore`, a :class:`~collections.abc.MutableMapping` with
-support for sorted iteration, slicing, range queries, multi-key lookups,
-batch writes, TTL expiration, and pluggable serialization.
-
-Usage::
+:class:`KVStore` is a :class:`~collections.abc.MutableMapping` with sorted
+iteration, slicing, range/prefix/pattern queries, multi-key lookups, batch
+writes, TTL expiration, atomic operations, memoization, and pluggable
+serialization.  Every method has an ``a``-prefixed async twin that runs the
+sync implementation on a worker thread::
 
     from obele import Database, KVStore
 
@@ -12,20 +12,16 @@ Usage::
     store = KVStore("settings")
 
     store["theme"] = "dark"
-    store["lang"]  = "en"
-    print(store["theme"])             # "dark"
-    print(store["a":"z"])             # dict of all keys in [a, z)
-
-    # TTL support
-    store.set("temp", "value", ttl=300)  # expires in 5 minutes
-
-    # Multi-key
-    store.get_many("theme", "lang")   # {"theme": "dark", "lang": "en"}
+    store.set("temp", "value", ttl=300)      # expires in 5 minutes
+    store["a":"z"]                           # dict of keys in [a, z)
+    store.get_many("theme", "lang")
+    await store.aset("feature", True)
 """
 
 from __future__ import annotations
 
-
+import functools
+import inspect
 import json
 import math
 import pickle
@@ -34,7 +30,7 @@ from collections.abc import Hashable, Iterable, Iterator, Mapping, MutableMappin
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Literal
 
-from ..orm.database import Database
+from ..orm.database import Database, athread, awrite
 from ..orm.sql import validate_identifier
 
 _Dumps = Callable[[Any], bytes]
@@ -45,15 +41,11 @@ MultiGetReturn = Literal["dict", "tuple"]
 
 _MISSING = object()
 
-_SORTABLE_KEY_TYPES: dict[type[Any], str] = {
-    int: "int", float: "float", str: "str", bytes: "bytes",
-}
+_SORTABLE_KEY_TYPES: dict[type[Any], str] = {int: "int", float: "float", str: "str", bytes: "bytes"}
 _SORTABLE_KEY_FORMATS: dict[str, type[Any]] = {v: k for k, v in _SORTABLE_KEY_TYPES.items()}
+_SORTABLE_COLUMNS: dict[str, str] = {"int": "key_int", "float": "key_real", "str": "key_text", "bytes": "key_blob"}
 
-
-def _validate_identifier(name: str) -> str:
-    """Ensure *name* is a safe SQLite identifier."""
-    return validate_identifier(name, kind="table_name")
+_NOT_EXPIRED = "(expires_at IS NULL OR expires_at > ?)"
 
 
 def _ensure_hashable(key: Any) -> None:
@@ -62,7 +54,7 @@ def _ensure_hashable(key: Any) -> None:
 
 
 def _json_safe_encode(value: Any) -> bytes:
-    """Encode *value* as compact JSON, raising ``TypeError`` on failure."""
+    """Encode *value* as compact JSON, raising ``TypeError`` unless lossless."""
     try:
         text = json.dumps(value, ensure_ascii=False, separators=(",", ":"))
     except (TypeError, ValueError) as exc:
@@ -71,6 +63,21 @@ def _json_safe_encode(value: Any) -> bytes:
     if type(round_tripped) is not type(value) or round_tripped != value:
         raise TypeError("JSON serialization would not preserve the original value type")
     return text.encode("utf-8")
+
+
+def _prefix_upper(prefix: str) -> str | None:
+    """Smallest string greater than every string starting with *prefix*.
+
+    Returns ``None`` when the prefix is unbounded (empty or all U+10FFFF).
+    """
+    for i in range(len(prefix) - 1, -1, -1):
+        code = ord(prefix[i])
+        if code < 0x10FFFF:
+            code += 1
+            if 0xD800 <= code <= 0xDFFF:  # skip the surrogate range
+                code = 0xE000
+            return prefix[:i] + chr(code)
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -90,57 +97,42 @@ class _EncodedValue:
     value_payload: bytes
 
 
-# SQL fragments cached per-table to avoid repeated f-string allocation
-_UPSERT_SQL_CACHE: dict[str, str] = {}
-
-
-def _get_upsert_sql(table: str) -> str:
-    """Return the cached UPSERT SQL template for a table."""
-    sql = _UPSERT_SQL_CACHE.get(table)
-    if sql is None:
-        sql = f"""
-            INSERT INTO {table} (
-                lookup_key, namespace, key_format, key_payload,
-                key_int, key_real, key_text, key_blob,
-                value_format, value_payload, expires_at
-            )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(lookup_key) DO UPDATE SET
-                namespace      = excluded.namespace,
-                key_format     = excluded.key_format,
-                key_payload    = excluded.key_payload,
-                key_int        = excluded.key_int,
-                key_real       = excluded.key_real,
-                key_text       = excluded.key_text,
-                key_blob       = excluded.key_blob,
-                value_format   = excluded.value_format,
-                value_payload  = excluded.value_payload,
-                expires_at     = excluded.expires_at
-        """
-        _UPSERT_SQL_CACHE[table] = sql
-    return sql
+@functools.lru_cache(maxsize=64)
+def _upsert_sql(table: str) -> str:
+    return f"""
+        INSERT INTO {table} (
+            lookup_key, namespace, key_format, key_payload,
+            key_int, key_real, key_text, key_blob,
+            value_format, value_payload, expires_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(lookup_key) DO UPDATE SET
+            namespace      = excluded.namespace,
+            key_format     = excluded.key_format,
+            key_payload    = excluded.key_payload,
+            key_int        = excluded.key_int,
+            key_real       = excluded.key_real,
+            key_text       = excluded.key_text,
+            key_blob       = excluded.key_blob,
+            value_format   = excluded.value_format,
+            value_payload  = excluded.value_payload,
+            expires_at     = excluded.expires_at
+    """
 
 
 class KVStore(MutableMapping[Any, Any]):
     """A fast, single-table key-value store with a dict-like interface.
 
-    Parameters
-    ----------
-    table_name:
-        SQLite table name (must be a valid identifier).
-    key_type:
-        Optional Python type constraining keys - ``int``, ``float``,
-        ``str``, or ``bytes``.
-    enforce_key_type:
-        When ``True`` (default), all keys must share the same sortable
-        type, enabling ordered iteration and range queries.
-    serializer:
-        ``"auto"`` (default) tries JSON first then falls back to pickle.
-        ``"json"`` forces JSON-only.  ``"pickle"`` forces pickle-only.
-        A ``(dumps, loads)`` callable pair for custom serialization.
-    namespace:
-        Optional string prefix applied to all keys, enabling multiple
-        logical stores in one table.
+    Args:
+        table_name: SQLite table name (must be a valid identifier).
+        key_type: Optional type constraining keys - ``int``, ``float``,
+            ``str``, or ``bytes``.
+        enforce_key_type: When ``True`` (default), all keys must share one
+            sortable type, enabling ordered iteration and range queries.
+        serializer: ``"auto"`` (JSON first, pickle fallback - default),
+            ``"json"``, ``"pickle"``, or a ``(dumps, loads)`` callable pair.
+        namespace: Optional prefix isolating multiple logical stores in
+            one table.
     """
 
     def __init__(
@@ -152,19 +144,16 @@ class KVStore(MutableMapping[Any, Any]):
         serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
         namespace: str | None = None,
     ) -> None:
-        self._table = _validate_identifier(table_name)
+        self._table = validate_identifier(table_name, kind="table_name")
         self._enforce = enforce_key_type
         self._declared_key_type = key_type
         self._resolved_key_type: type[Any] | None = key_type
-        self._resolved_key_format: str | None = (
-            _SORTABLE_KEY_TYPES.get(key_type) if key_type else None
-        )
+        self._resolved_key_format: str | None = _SORTABLE_KEY_TYPES.get(key_type) if key_type else None
         self._namespace = "" if namespace is None else str(namespace)
 
         if enforce_key_type and key_type is not None and key_type not in _SORTABLE_KEY_TYPES:
             raise TypeError(
-                f"enforce_key_type only supports int, float, str, or bytes keys, "
-                f"got {key_type.__name__}"
+                f"enforce_key_type only supports int, float, str, or bytes keys, got {key_type.__name__}"
             )
 
         if isinstance(serializer, tuple):
@@ -173,8 +162,7 @@ class KVStore(MutableMapping[Any, Any]):
         else:
             if serializer not in ("auto", "json", "pickle"):
                 raise ValueError(
-                    f"serializer must be 'auto', 'json', 'pickle', or a "
-                    f"(dumps, loads) tuple, got {serializer!r}"
+                    f"serializer must be 'auto', 'json', 'pickle', or a (dumps, loads) tuple, got {serializer!r}"
                 )
             self._custom_dumps = None
             self._custom_loads = None
@@ -189,131 +177,58 @@ class KVStore(MutableMapping[Any, Any]):
 
     @property
     def table_name(self) -> str:
-        """The SQLite table name backing this store."""
+        """The SQLite table backing this store."""
         return self._table
 
     @property
     def key_type(self) -> type[Any] | None:
-        """Resolved key type (``None`` if not yet determined)."""
+        """Resolved key type (``None`` until first use)."""
         return self._resolved_key_type
 
     @property
     def namespace(self) -> str:
-        """Logical namespace isolating this store's keys in the table."""
+        """Logical namespace isolating this store's keys within the table."""
         return self._namespace
 
-    # ------------------------------------------------------------------
-    # Namespace support
-    # ------------------------------------------------------------------
-
-    def _apply_namespace(self, key: Any) -> Any:
-        """Return *key* unchanged; namespace is stored separately."""
-        return key
-
-    def _strip_namespace(self, key: Any) -> Any:
-        """Return *key* unchanged; namespace is stored separately."""
-        return key
-
-    def _namespaced_lookup_key(self, lookup_key: bytes) -> bytes:
-        """Return a physical lookup key isolated by this store's namespace."""
-        if not self._namespace:
-            return lookup_key
-        prefix = self._namespace.encode("utf-8")
-        return b"ns:" + prefix + b"\0" + lookup_key
+    def __repr__(self) -> str:
+        key_name = self._resolved_key_type.__name__ if self._resolved_key_type else "unset"
+        return (
+            f"<{type(self).__name__} table={self._table!r} namespace={self._namespace!r} "
+            f"key_type={key_name} enforce={self._enforce}>"
+        )
 
     # ------------------------------------------------------------------
     # Table management
     # ------------------------------------------------------------------
 
     def _ensure_table(self) -> None:
-        """Create the backing table and partial indexes if they don't exist."""
-        Database.execute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self._table} (
-                lookup_key   BLOB PRIMARY KEY,
-                namespace    TEXT NOT NULL DEFAULT '',
-                key_format   TEXT NOT NULL,
-                key_payload  BLOB NOT NULL,
-                key_int      INTEGER,
-                key_real     REAL,
-                key_text     TEXT,
-                key_blob     BLOB,
-                value_format TEXT NOT NULL,
-                value_payload BLOB NOT NULL,
-                expires_at   REAL
-            ) WITHOUT ROWID
-            """
-        )
-        columns = {
-            row["name"]
-            for row in Database.fetchall(f"PRAGMA table_info({self._table})")
-        }
-        if "namespace" not in columns:
-            Database.execute(
-                f"ALTER TABLE {self._table} "
-                "ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
-            )
-        Database.execute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace
-            ON {self._table} (namespace)
-            """
-        )
-        for col in ("key_int", "key_real", "key_text", "key_blob"):
+        """Create the backing table and partial indexes when missing."""
+        with Database.transaction():
             Database.execute(
                 f"""
-                CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace_{col}
-                ON {self._table} (namespace, {col})
-                WHERE {col} IS NOT NULL
+                CREATE TABLE IF NOT EXISTS {self._table} (
+                    lookup_key   BLOB PRIMARY KEY,
+                    namespace    TEXT NOT NULL DEFAULT '',
+                    key_format   TEXT NOT NULL,
+                    key_payload  BLOB NOT NULL,
+                    key_int      INTEGER,
+                    key_real     REAL,
+                    key_text     TEXT,
+                    key_blob     BLOB,
+                    value_format TEXT NOT NULL,
+                    value_payload BLOB NOT NULL,
+                    expires_at   REAL
+                ) WITHOUT ROWID
                 """
             )
-
-    async def _aensure_table(self) -> None:
-        """Async version of :meth:`_ensure_table`."""
-        cursor = await Database.aexecute(
-            f"""
-            CREATE TABLE IF NOT EXISTS {self._table} (
-                lookup_key   BLOB PRIMARY KEY,
-                namespace    TEXT NOT NULL DEFAULT '',
-                key_format   TEXT NOT NULL,
-                key_payload  BLOB NOT NULL,
-                key_int      INTEGER,
-                key_real     REAL,
-                key_text     TEXT,
-                key_blob     BLOB,
-                value_format TEXT NOT NULL,
-                value_payload BLOB NOT NULL,
-                expires_at   REAL
-            ) WITHOUT ROWID
-            """
-        )
-        await cursor.close()
-        columns = {
-            row["name"]
-            for row in await Database.afetchall(f"PRAGMA table_info({self._table})")
-        }
-        if "namespace" not in columns:
-            cursor = await Database.aexecute(
-                f"ALTER TABLE {self._table} "
-                "ADD COLUMN namespace TEXT NOT NULL DEFAULT ''"
+            Database.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace ON {self._table} (namespace)"
             )
-            await cursor.close()
-        cursor = await Database.aexecute(
-            f"""
-            CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace
-            ON {self._table} (namespace)
-            """
-        )
-        await cursor.close()
-        for col in ("key_int", "key_real", "key_text", "key_blob"):
-            cursor = await Database.aexecute(
-                f"""
-                CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace_{col}
-                ON {self._table} (namespace, {col})
-                WHERE {col} IS NOT NULL
-                """
-            )
-            await cursor.close()
+            for col in _SORTABLE_COLUMNS.values():
+                Database.execute(
+                    f"CREATE INDEX IF NOT EXISTS idx_{self._table}_namespace_{col} "
+                    f"ON {self._table} (namespace, {col}) WHERE {col} IS NOT NULL"
+                )
 
     def _load_existing_key_type(self) -> None:
         """Detect and validate the key type of existing rows."""
@@ -322,8 +237,7 @@ class KVStore(MutableMapping[Any, Any]):
         formats = [
             row["key_format"]
             for row in Database.fetchall(
-                f"SELECT DISTINCT key_format FROM {self._table} "
-                f"WHERE namespace = ? LIMIT 2",
+                f"SELECT DISTINCT key_format FROM {self._table} WHERE namespace = ? LIMIT 2",
                 [self._namespace],
             )
         ]
@@ -331,15 +245,12 @@ class KVStore(MutableMapping[Any, Any]):
             return
         if len(formats) > 1:
             raise ValueError(
-                f"{self._table!r} contains mixed key types; "
-                f"set enforce_key_type=False to use it"
+                f"{self._table!r} contains mixed key types; set enforce_key_type=False to use it"
             )
-        existing_format = formats[0]
-        existing_type = _SORTABLE_KEY_FORMATS.get(existing_format)
+        existing_type = _SORTABLE_KEY_FORMATS.get(formats[0])
         if existing_type is None:
             raise ValueError(
-                f"{self._table!r} contains non-sortable keys; "
-                f"set enforce_key_type=False to use it"
+                f"{self._table!r} contains non-sortable keys; set enforce_key_type=False to use it"
             )
         if self._declared_key_type is not None and existing_type is not self._declared_key_type:
             raise ValueError(
@@ -347,15 +258,15 @@ class KVStore(MutableMapping[Any, Any]):
                 f"not {self._declared_key_type.__name__}"
             )
         self._resolved_key_type = existing_type
-        self._resolved_key_format = existing_format
+        self._resolved_key_format = formats[0]
 
-    def create_table(self, if_not_exists: bool = True) -> None:
+    def create_table(self) -> None:
         """Explicitly (re-)create the backing table."""
         self._ensure_table()
 
-    async def acreate_table(self, if_not_exists: bool = True) -> None:
+    async def acreate_table(self) -> None:
         """Async version of :meth:`create_table`."""
-        await self._aensure_table()
+        await awrite(self._ensure_table)
 
     def drop_table(self, if_exists: bool = True) -> None:
         """Drop the backing table."""
@@ -364,608 +275,10 @@ class KVStore(MutableMapping[Any, Any]):
 
     async def adrop_table(self, if_exists: bool = True) -> None:
         """Async version of :meth:`drop_table`."""
-        maybe = "IF EXISTS " if if_exists else ""
-        cursor = await Database.aexecute(f"DROP TABLE {maybe}{self._table}")
-        await cursor.close()
+        await awrite(self.drop_table, if_exists)
 
     # ------------------------------------------------------------------
-    # TTL support
-    # ------------------------------------------------------------------
-
-    def _now(self) -> float:
-        """Current time as a Unix timestamp."""
-        return time.time()
-
-    def _is_expired(self, row: Mapping[str, Any]) -> bool:
-        """Check if a row has expired based on its expires_at field."""
-        expires_at = row.get("expires_at") if isinstance(row, dict) else row["expires_at"]
-        return expires_at is not None and expires_at <= self._now()
-
-    def purge_expired(self) -> int:
-        """Delete all expired entries. Returns number of rows removed."""
-        cursor = Database.execute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-            [self._namespace, self._now()],
-        )
-        return cursor.rowcount
-
-    async def apurge_expired(self) -> int:
-        """Async version of :meth:`purge_expired`."""
-        cursor = await Database.aexecute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-            [self._namespace, self._now()],
-        )
-        try:
-            return cursor.rowcount
-        finally:
-            await cursor.close()
-
-    def ttl(self, key: Any) -> float | None:
-        """Return seconds until expiration, or ``None`` for persistent keys."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        row = Database.fetchone(
-            f"SELECT expires_at FROM {self._table} "
-            f"WHERE lookup_key = ? AND namespace = ? LIMIT 1",
-            [encoded.lookup_key, self._namespace],
-        )
-        if row is None:
-            raise KeyError(self._strip_namespace(key))
-        expires_at = row["expires_at"]
-        if expires_at is None:
-            return None
-        remaining = expires_at - self._now()
-        if remaining <= 0:
-            self.delete(key)
-            raise KeyError(self._strip_namespace(key))
-        return remaining
-
-    async def attl(self, key: Any) -> float | None:
-        """Async version of :meth:`ttl`."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        row = await Database.afetchone(
-            f"SELECT expires_at FROM {self._table} "
-            f"WHERE lookup_key = ? AND namespace = ? LIMIT 1",
-            [encoded.lookup_key, self._namespace],
-        )
-        if row is None:
-            raise KeyError(self._strip_namespace(key))
-        expires_at = row["expires_at"]
-        if expires_at is None:
-            return None
-        remaining = expires_at - self._now()
-        if remaining <= 0:
-            cursor = await Database.aexecute(
-                f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-                [encoded.lookup_key, self._namespace],
-            )
-            await cursor.close()
-            raise KeyError(self._strip_namespace(key))
-        return remaining
-
-    def expire(self, key: Any, ttl: float | int) -> bool:
-        """Set a new TTL for an existing key."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = Database.execute(
-            f"UPDATE {self._table} SET expires_at = ? "
-            f"WHERE lookup_key = ? AND namespace = ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [self._now() + ttl, encoded.lookup_key, self._namespace, self._now()],
-        )
-        return cursor.rowcount > 0
-
-    async def aexpire(self, key: Any, ttl: float | int) -> bool:
-        """Async version of :meth:`expire`."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = await Database.aexecute(
-            f"UPDATE {self._table} SET expires_at = ? "
-            f"WHERE lookup_key = ? AND namespace = ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [self._now() + ttl, encoded.lookup_key, self._namespace, self._now()],
-        )
-        try:
-            return cursor.rowcount > 0
-        finally:
-            await cursor.close()
-
-    def persist(self, key: Any) -> bool:
-        """Remove the TTL from an existing key."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = Database.execute(
-            f"UPDATE {self._table} SET expires_at = NULL "
-            f"WHERE lookup_key = ? AND namespace = ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [encoded.lookup_key, self._namespace, self._now()],
-        )
-        return cursor.rowcount > 0
-
-    async def apersist(self, key: Any) -> bool:
-        """Async version of :meth:`persist`."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = await Database.aexecute(
-            f"UPDATE {self._table} SET expires_at = NULL "
-            f"WHERE lookup_key = ? AND namespace = ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [encoded.lookup_key, self._namespace, self._now()],
-        )
-        try:
-            return cursor.rowcount > 0
-        finally:
-            await cursor.close()
-
-    # ------------------------------------------------------------------
-    # MutableMapping core interface
-    # ------------------------------------------------------------------
-
-    def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, slice):
-            return self.range(key.start, key.stop, step=key.step)
-
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        row = self._fetch_row(encoded.lookup_key)
-        if row is None or self._is_expired(row):
-            if row is not None:
-                # Lazy cleanup of expired entry
-                Database.execute(
-                    f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-                    [encoded.lookup_key, self._namespace],
-                )
-            raise KeyError(self._strip_namespace(key))
-        return self._decode_value(row["value_format"], row["value_payload"])
-
-    def __setitem__(self, key: Any, value: Any) -> None:
-        self.set(key, value)
-
-    def __delitem__(self, key: Any) -> None:
-        self.delete(key)
-
-    def __contains__(self, key: object) -> bool:
-        if isinstance(key, slice):
-            return False
-        try:
-            key = self._apply_namespace(key)
-            encoded = self._encode_key(key)
-        except (TypeError, ValueError, pickle.PickleError):
-            return False
-        row = Database.fetchone(
-            f"SELECT expires_at FROM {self._table} "
-            f"WHERE lookup_key = ? AND namespace = ? LIMIT 1",
-            [encoded.lookup_key, self._namespace],
-        )
-        if row is None:
-            return False
-        if self._is_expired(row):
-            Database.execute(
-                f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-                [encoded.lookup_key, self._namespace],
-            )
-            return False
-        return True
-
-    def __len__(self) -> int:
-        count = Database.fetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND (expires_at IS NULL OR expires_at > ?)",
-            [self._namespace, self._now()],
-            column="cnt",
-        )
-        return int(count or 0)
-
-    def __bool__(self) -> bool:
-        row = Database.fetchone(
-            f"SELECT 1 FROM {self._table} "
-            f"WHERE namespace = ? AND (expires_at IS NULL OR expires_at > ?) LIMIT 1",
-            [self._namespace, self._now()],
-        )
-        return row is not None
-
-    def __iter__(self) -> Iterator[Any]:
-        for row in self._select_rows():
-            yield self._strip_namespace(self._decode_key(row))
-
-    async def __aiter__(self):
-        for key in await self.akeys():
-            yield key
-
-    def __repr__(self) -> str:
-        key_name = self._resolved_key_type.__name__ if self._resolved_key_type else "unset"
-        return (
-            f"<KVStore table={self._table!r} namespace={self._namespace!r} "
-            f"key_type={key_name} enforce={self._enforce}>"
-        )
-
-    # ------------------------------------------------------------------
-    # Extended dict interface
-    # ------------------------------------------------------------------
-
-    def get(self, key: Any, default: Any = None) -> Any:
-        """Return the value for *key*, or *default* if not present."""
-        try:
-            return self[key]
-        except KeyError:
-            return default
-
-    def set(
-        self,
-        key: Any,
-        value: Any,
-        *,
-        serializer: SerializerMode | None = None,
-        ttl: float | int | None = None,
-    ) -> None:
-        """Insert or replace a single key-value pair.
-
-        Args:
-            serializer: Per-call serializer override.
-            ttl: Time-to-live in seconds. ``None`` means no expiration.
-        """
-        key = self._apply_namespace(key)
-        encoded_key = self._encode_key(key)
-        encoded_value = self._encode_value(value, serializer)
-        expires_at = (self._now() + ttl) if ttl is not None else None
-        Database.execute(_get_upsert_sql(self._table), [
-            encoded_key.lookup_key,
-            self._namespace,
-            encoded_key.key_format,
-            encoded_key.key_payload,
-            encoded_key.key_int,
-            encoded_key.key_real,
-            encoded_key.key_text,
-            encoded_key.key_blob,
-            encoded_value.value_format,
-            encoded_value.value_payload,
-            expires_at,
-        ])
-
-    def pop(self, key: Any, *args: Any) -> Any:
-        """Remove and return the value for *key*."""
-        with Database.transaction():
-            try:
-                value = self[key]
-            except KeyError:
-                if args:
-                    return args[0]
-                raise
-            self.delete(key)
-            return value
-
-    def popitem(self, last: bool = True) -> tuple[Any, Any]:
-        """Remove and return an arbitrary ``(key, value)`` pair."""
-        with Database.transaction():
-            rows = self._select_rows(limit=1, reverse=last)
-            if not rows:
-                raise KeyError("store is empty")
-            row = rows[0]
-            key = self._strip_namespace(self._decode_key(row))
-            value = self._decode_value(row["value_format"], row["value_payload"])
-            self.delete(key)
-            return key, value
-
-    def setdefault(self, key: Any, default: Any = None) -> Any:
-        """Return the value for *key*, inserting *default* first if missing."""
-        with Database.transaction():
-            try:
-                return self[key]
-            except KeyError:
-                self[key] = default
-                return default
-
-    def update(self, other: Mapping[Any, Any] | Iterable[tuple[Any, Any]] = (), /, **kwargs: Any) -> None:
-        """Bulk-insert / update from a mapping, iterable, and/or keyword arguments."""
-        pairs: list[tuple[Any, Any]] = []
-        if isinstance(other, Mapping):
-            pairs.extend(other.items())
-        else:
-            pairs.extend(other)
-        if kwargs:
-            pairs.extend(kwargs.items())
-        if pairs:
-            self.set_many(pairs)
-
-    def clear(self) -> None:
-        """Remove **all** key-value pairs from the store."""
-        Database.execute(f"DELETE FROM {self._table} WHERE namespace = ?", [self._namespace])
-
-    def keys(self) -> list[Any]:
-        """Return all keys, in sort order."""
-        return [self._strip_namespace(self._decode_key(row)) for row in self._select_rows()]
-
-    def values(self) -> list[Any]:
-        """Return all values, ordered by key."""
-        return [
-            self._decode_value(row["value_format"], row["value_payload"])
-            for row in self._select_rows()
-        ]
-
-    def items(self) -> list[tuple[Any, Any]]:
-        """Return all ``(key, value)`` pairs, ordered by key."""
-        return [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in self._select_rows()
-        ]
-
-    def delete(self, key: Any) -> None:
-        """Delete a single key. Raises ``KeyError`` if not present."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = Database.execute(
-            f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-            [encoded.lookup_key, self._namespace],
-        )
-        if cursor.rowcount == 0:
-            raise KeyError(self._strip_namespace(key))
-
-    # ------------------------------------------------------------------
-    # Atomic operations
-    # ------------------------------------------------------------------
-
-    def increment(self, key: Any, delta: int | float = 1) -> int | float:
-        """Atomically increment a numeric value. Creates the key if missing.
-
-        Args:
-            key: The key to increment.
-            delta: Amount to add (default 1). Can be negative.
-
-        Returns:
-            The new value after incrementing.
-        """
-        with Database.transaction():
-            try:
-                current = self[key]
-                if not isinstance(current, (int, float)):
-                    raise TypeError(f"Cannot increment non-numeric value: {type(current).__name__}")
-                new_value = current + delta
-            except KeyError:
-                new_value = delta
-            self[key] = new_value
-            return new_value
-
-    async def aincrement(self, key: Any, delta: int | float = 1) -> int | float:
-        """Async version of :meth:`increment`."""
-        async with Database.transaction():
-            try:
-                current = await self.aget(key)
-                if not isinstance(current, (int, float)):
-                    raise TypeError(f"Cannot increment non-numeric value: {type(current).__name__}")
-                new_value = current + delta
-            except KeyError:
-                new_value = delta
-            await self.aset(key, new_value)
-            return new_value
-
-    def compare_and_swap(
-        self,
-        key: Any,
-        expected: Any,
-        new_value: Any,
-        *,
-        ttl: float | int | None = None,
-    ) -> bool:
-        """Atomically set ``key`` to ``new_value`` if its value equals ``expected``."""
-        with Database.transaction():
-            try:
-                current = self[key]
-            except KeyError:
-                return False
-            if current != expected:
-                return False
-            self.set(key, new_value, ttl=ttl)
-            return True
-
-    async def acompare_and_swap(
-        self,
-        key: Any,
-        expected: Any,
-        new_value: Any,
-        *,
-        ttl: float | int | None = None,
-    ) -> bool:
-        """Async version of :meth:`compare_and_swap`."""
-        async with Database.transaction():
-            try:
-                current = await self.aget(key)
-            except KeyError:
-                return False
-            if current != expected:
-                return False
-            await self.aset(key, new_value, ttl=ttl)
-            return True
-
-    # ------------------------------------------------------------------
-    # Batch operations
-    # ------------------------------------------------------------------
-
-    def set_many(
-        self,
-        items: Mapping[Any, Any] | Iterable[tuple[Any, Any]],
-        *,
-        serializer: SerializerMode | None = None,
-        ttl: float | int | None = None,
-    ) -> None:
-        """Insert or replace many key-value pairs efficiently."""
-        if isinstance(items, Mapping):
-            pairs = list(items.items())
-        else:
-            pairs = list(items)
-        if not pairs:
-            return
-
-        expires_at = (self._now() + ttl) if ttl is not None else None
-        sql = _get_upsert_sql(self._table)
-        params_seq: list[list[Any]] = []
-        for key, value in pairs:
-            key = self._apply_namespace(key)
-            ek = self._encode_key(key)
-            ev = self._encode_value(value, serializer)
-            params_seq.append([
-                ek.lookup_key, self._namespace, ek.key_format, ek.key_payload,
-                ek.key_int, ek.key_real, ek.key_text, ek.key_blob,
-                ev.value_format, ev.value_payload, expires_at,
-            ])
-        Database.executemany(sql, params_seq)
-
-    def delete_many(self, keys: Sequence[Any] | Iterable[Any]) -> int:
-        """Delete multiple keys at once.  Returns the number of rows removed."""
-        keys_list = list(keys)
-        if not keys_list:
-            return 0
-        encoded_keys = [self._encode_key(self._apply_namespace(k)).lookup_key for k in keys_list]
-        placeholders = ", ".join("?" for _ in encoded_keys)
-        cursor = Database.execute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND lookup_key IN ({placeholders})",
-            [self._namespace, *encoded_keys],
-        )
-        return cursor.rowcount
-
-    # ------------------------------------------------------------------
-    # Multi-key queries
-    # ------------------------------------------------------------------
-
-    def get_many(
-        self,
-        *keys: Any,
-        return_type: MultiGetReturn = "dict",
-        default: Any = _MISSING,
-        skip_missing: bool = False,
-    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Fetch many keys at once."""
-        if not keys:
-            return {} if return_type == "dict" else ()
-
-        encoded_pairs = [(k, self._encode_key(self._apply_namespace(k))) for k in keys]
-        placeholders = ", ".join("?" for _ in encoded_pairs)
-        rows_raw = Database.fetchall(
-            f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND lookup_key IN ({placeholders})",
-            [self._namespace, *[enc.lookup_key for _, enc in encoded_pairs]],
-        )
-        now = self._now()
-        rows = {
-            bytes(row["lookup_key"]): row
-            for row in rows_raw
-            if row["expires_at"] is None or row["expires_at"] > now
-        }
-
-        pairs: list[tuple[Any, Any]] = []
-        for original_key, encoded in encoded_pairs:
-            row = rows.get(encoded.lookup_key)
-            if row is None:
-                if skip_missing:
-                    continue
-                if default is _MISSING:
-                    raise KeyError(original_key)
-                pairs.append((original_key, default))
-                continue
-            pairs.append((
-                original_key,
-                self._decode_value(row["value_format"], row["value_payload"]),
-            ))
-        return self._format_pairs(pairs, return_type)
-
-    # ------------------------------------------------------------------
-    # Slicing / range queries
-    # ------------------------------------------------------------------
-
-    def range(
-        self,
-        start: Any = None,
-        stop: Any = None,
-        *,
-        step: int | None = None,
-        reverse: bool = False,
-        return_type: MultiGetReturn = "dict",
-    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Return items whose keys lie in ``[start, stop)``.
-
-        Requires ``enforce_key_type=True`` with a sortable key type.
-        """
-        if step is not None:
-            if step == 0:
-                raise ValueError("step cannot be zero")
-            if step < 0:
-                raise ValueError("negative steps are not supported; use reverse=True")
-
-        if not self._enforce:
-            raise TypeError("range / slice queries require enforce_key_type=True")
-
-        if self._resolved_key_type is None:
-            if len(self) == 0:
-                return {} if return_type == "dict" else ()
-            self._load_existing_key_type()
-
-        if self._resolved_key_type is None or self._resolved_key_format is None:
-            raise TypeError("range / slice queries require a resolved sortable key type")
-
-        column = self._sortable_column_for_format(self._resolved_key_format)
-        params: list[Any] = [self._namespace, self._resolved_key_format]
-        where_clauses = [
-            "namespace = ?",
-            "key_format = ?",
-            "(expires_at IS NULL OR expires_at > ?)",
-        ]
-        params.append(self._now())
-
-        if start is not None:
-            self._ensure_range_key_type(start)
-            where_clauses.append(f"{column} >= ?")
-            params.append(start)
-        if stop is not None:
-            self._ensure_range_key_type(stop)
-            where_clauses.append(f"{column} < ?")
-            params.append(stop)
-
-        order = "DESC" if reverse else "ASC"
-        sql = (
-            f"SELECT * FROM {self._table} "
-            f"WHERE {' AND '.join(where_clauses)} "
-            f"ORDER BY {column} {order}"
-        )
-        rows = Database.fetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
-        if step not in (None, 1):
-            pairs = pairs[::step]
-        return self._format_pairs(pairs, return_type)
-
-    def keys_slice(
-        self,
-        start: Any = None,
-        stop: Any = None,
-        *,
-        step: int | None = None,
-        reverse: bool = False,
-    ) -> tuple[Any, ...]:
-        """Return only keys from a :meth:`range` query."""
-        pairs = self.range(start, stop, step=step, reverse=reverse, return_type="tuple")
-        return tuple(k for k, _ in pairs)
-
-    def values_slice(
-        self,
-        start: Any = None,
-        stop: Any = None,
-        *,
-        step: int | None = None,
-        reverse: bool = False,
-    ) -> tuple[Any, ...]:
-        """Return only values from a :meth:`range` query."""
-        pairs = self.range(start, stop, step=step, reverse=reverse, return_type="tuple")
-        return tuple(v for _, v in pairs)
-
-    # ------------------------------------------------------------------
-    # Key encoding / decoding
+    # Encoding / decoding
     # ------------------------------------------------------------------
 
     def _encode_key(self, key: Any) -> _EncodedKey:
@@ -973,86 +286,59 @@ class KVStore(MutableMapping[Any, Any]):
         encoded = self._encode_sortable_key(key) if self._enforce else self._encode_flexible_key(key)
         if not self._namespace:
             return encoded
-        return replace(encoded, lookup_key=self._namespaced_lookup_key(encoded.lookup_key))
+        prefixed = b"ns:" + self._namespace.encode("utf-8") + b"\0" + encoded.lookup_key
+        return replace(encoded, lookup_key=prefixed)
 
     def _encode_sortable_key(self, key: Any) -> _EncodedKey:
         key_type = type(key)
         key_format = _SORTABLE_KEY_TYPES.get(key_type)
         if key_format is None:
             raise TypeError(
-                f"enforce_key_type only supports int, float, str, or bytes keys, "
-                f"got {key_type.__name__}"
+                f"enforce_key_type only supports int, float, str, or bytes keys, got {key_type.__name__}"
             )
-
         if self._resolved_key_type is None:
             self._resolved_key_type = key_type
             self._resolved_key_format = key_format
         elif key_type is not self._resolved_key_type:
-            raise TypeError(
-                f"expected {self._resolved_key_type.__name__} keys, got {key_type.__name__}"
-            )
-
-        return self._build_sortable_encoded_key(key, key_type, key_format)
+            raise TypeError(f"expected {self._resolved_key_type.__name__} keys, got {key_type.__name__}")
+        return self._build_sortable_key(key, key_type)
 
     def _encode_flexible_key(self, key: Any) -> _EncodedKey:
-        key_type = type(key)
-        if key_type in _SORTABLE_KEY_TYPES:
-            return self._build_sortable_encoded_key(
-                key, key_type, _SORTABLE_KEY_TYPES[key_type],
-            )
+        if type(key) in _SORTABLE_KEY_TYPES:
+            return self._build_sortable_key(key, type(key))
         try:
             payload = pickle.dumps(key, protocol=pickle.HIGHEST_PROTOCOL)
         except pickle.PickleError as exc:
             raise TypeError("key is not picklable") from exc
-        return _EncodedKey(
-            lookup_key=b"pickle:" + payload,
-            key_format="pickle",
-            key_payload=payload,
-        )
+        return _EncodedKey(lookup_key=b"pickle:" + payload, key_format="pickle", key_payload=payload)
 
     @staticmethod
-    def _build_sortable_encoded_key(key: Any, key_type: type, key_format: str) -> _EncodedKey:
+    def _build_sortable_key(key: Any, key_type: type) -> _EncodedKey:
         if key_type is int:
             payload = str(key).encode("ascii")
-            return _EncodedKey(lookup_key=b"int:" + payload, key_format="int",
-                               key_payload=payload, key_int=key)
+            return _EncodedKey(b"int:" + payload, "int", payload, key_int=key)
         if key_type is float:
             if not math.isfinite(key):
                 raise ValueError("float keys must be finite")
             payload = repr(key).encode("ascii")
-            return _EncodedKey(lookup_key=b"float:" + payload, key_format="float",
-                               key_payload=payload, key_real=key)
+            return _EncodedKey(b"float:" + payload, "float", payload, key_real=key)
         if key_type is str:
             payload = key.encode("utf-8")
-            return _EncodedKey(lookup_key=b"str:" + payload, key_format="str",
-                               key_payload=payload, key_text=key)
-        # bytes
+            return _EncodedKey(b"str:" + payload, "str", payload, key_text=key)
         payload = bytes(key)
-        return _EncodedKey(lookup_key=b"bytes:" + payload, key_format="bytes",
-                           key_payload=payload, key_blob=payload)
-
-    # ------------------------------------------------------------------
-    # Value encoding / decoding
-    # ------------------------------------------------------------------
+        return _EncodedKey(b"bytes:" + payload, "bytes", payload, key_blob=payload)
 
     def _encode_value(self, value: Any, serializer: SerializerMode | None = None) -> _EncodedValue:
         mode = serializer or self._serializer_mode
-
         if mode == "custom":
             return _EncodedValue("custom", self._custom_dumps(value))
-
         if mode in ("auto", "json"):
             try:
-                payload = _json_safe_encode(value)
-                return _EncodedValue("json", payload)
+                return _EncodedValue("json", _json_safe_encode(value))
             except TypeError:
                 if mode == "json":
                     raise
-
-        return _EncodedValue(
-            "pickle",
-            pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL),
-        )
+        return _EncodedValue("pickle", pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL))
 
     def _decode_value(self, value_format: str, payload: bytes) -> Any:
         if value_format == "json":
@@ -1078,81 +364,11 @@ class KVStore(MutableMapping[Any, Any]):
             return pickle.loads(row["key_payload"])
         raise ValueError(f"unsupported key format {fmt!r}")
 
-    # ------------------------------------------------------------------
-    # Internal query helpers
-    # ------------------------------------------------------------------
-
-    def _fetch_row(self, lookup_key: bytes) -> Mapping[str, Any] | None:
-        return Database.fetchone(
-            f"SELECT * FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-            [lookup_key, self._namespace],
-        )
-
-    def _select_rows(self, *, limit: int | None = None, reverse: bool = False) -> list[Mapping[str, Any]]:
-        now = self._now()
-        if self._enforce and self._resolved_key_format is not None:
-            column = self._sortable_column_for_format(self._resolved_key_format)
-            order = f"ORDER BY {column} {'DESC' if reverse else 'ASC'}"
-            where = (
-                "WHERE namespace = ? AND key_format = ? "
-                "AND (expires_at IS NULL OR expires_at > ?)"
-            )
-            params: list[Any] = [self._namespace, self._resolved_key_format, now]
-        else:
-            order = f"ORDER BY lookup_key {'DESC' if reverse else 'ASC'}"
-            where = "WHERE namespace = ? AND (expires_at IS NULL OR expires_at > ?)"
-            params = [self._namespace, now]
-
-        limit_sql = f" LIMIT {limit}" if limit is not None else ""
-        sql = f"SELECT * FROM {self._table} {where} {order}{limit_sql}"
-        return Database.fetchall(sql, params)
-
-    async def _afetch_row(self, lookup_key: bytes) -> Mapping[str, Any] | None:
-        """Async version of :meth:`_fetch_row`."""
-        return await Database.afetchone(
-            f"SELECT * FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-            [lookup_key, self._namespace],
-        )
-
-    async def _aselect_rows(self, *, limit: int | None = None, reverse: bool = False) -> list[Mapping[str, Any]]:
-        """Async version of :meth:`_select_rows`."""
-        now = self._now()
-        if self._enforce and self._resolved_key_format is not None:
-            column = self._sortable_column_for_format(self._resolved_key_format)
-            order = f"ORDER BY {column} {'DESC' if reverse else 'ASC'}"
-            where = (
-                "WHERE namespace = ? AND key_format = ? "
-                "AND (expires_at IS NULL OR expires_at > ?)"
-            )
-            params: list[Any] = [self._namespace, self._resolved_key_format, now]
-        else:
-            order = f"ORDER BY lookup_key {'DESC' if reverse else 'ASC'}"
-            where = "WHERE namespace = ? AND (expires_at IS NULL OR expires_at > ?)"
-            params = [self._namespace, now]
-
-        limit_sql = f" LIMIT {limit}" if limit is not None else ""
-        sql = f"SELECT * FROM {self._table} {where} {order}{limit_sql}"
-        return await Database.afetchall(sql, params)
-
-    def _ensure_range_key_type(self, key: Any) -> None:
-        if self._resolved_key_type is not None and type(key) is not self._resolved_key_type:
-            raise TypeError(
-                f"range boundaries must be {self._resolved_key_type.__name__} values"
-            )
+    def _decode_pair(self, row: Mapping[str, Any]) -> tuple[Any, Any]:
+        return self._decode_key(row), self._decode_value(row["value_format"], row["value_payload"])
 
     @staticmethod
-    def _sortable_column_for_format(key_format: str) -> str:
-        mapping = {"int": "key_int", "float": "key_real", "str": "key_text", "bytes": "key_blob"}
-        col = mapping.get(key_format)
-        if col is None:
-            raise TypeError(f"{key_format!r} is not a sortable key format")
-        return col
-
-    @staticmethod
-    def _format_pairs(
-        pairs: Sequence[tuple[Any, Any]],
-        return_type: MultiGetReturn,
-    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+    def _format_pairs(pairs: Sequence[tuple[Any, Any]], return_type: MultiGetReturn) -> Any:
         if return_type == "dict":
             return dict(pairs)
         if return_type == "tuple":
@@ -1160,256 +376,112 @@ class KVStore(MutableMapping[Any, Any]):
         raise ValueError("return_type must be 'dict' or 'tuple'")
 
     # ------------------------------------------------------------------
-    # Prefix and pattern queries
+    # Internal query helpers
     # ------------------------------------------------------------------
 
-    def prefix(
-        self,
-        prefix: str,
-        *,
-        limit: int | None = None,
-        reverse: bool = False,
-        return_type: MultiGetReturn = "dict",
-    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Return all entries whose string key starts with *prefix*.
+    @staticmethod
+    def _now() -> float:
+        return time.time()
 
-        Requires ``key_type=str`` (enforced or resolved)::
-
-            store["user:1"] = {"name": "Alice"}
-            store["user:2"] = {"name": "Bob"}
-            store["post:1"] = {"title": "Hello"}
-
-            store.prefix("user:")  # {"user:1": ..., "user:2": ...}
-
-        Args:
-            prefix: The string prefix to match.
-            limit: Maximum number of results.
-            reverse: If ``True``, return in reverse key order.
-            return_type: ``"dict"`` or ``"tuple"``.
-        """
-        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
-            raise TypeError("prefix() requires string keys")
-
-        now = self._now()
-        order = "DESC" if reverse else "ASC"
-
-        # Namespace-aware prefix scan on key_text column
-        sql = (
-            f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
-            f"ORDER BY key_text {order}"
+    def _delete_by_lookup(self, lookup_key: bytes) -> int:
+        cursor = Database.execute(
+            f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
+            [lookup_key, self._namespace],
         )
-        # Build the exclusive upper bound by incrementing the last character
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        params: list[Any] = [self._namespace, prefix, upper, now]
+        return cursor.rowcount
 
-        if limit is not None:
-            sql += f" LIMIT {limit}"
-
-        rows = Database.fetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
-        return self._format_pairs(pairs, return_type)
-
-    def scan(
-        self,
-        pattern: str = "*",
-        *,
-        limit: int | None = None,
-        return_type: MultiGetReturn = "dict",
-    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Return entries whose string key matches a SQL GLOB *pattern*.
-
-        Uses SQLite's ``GLOB`` operator for pattern matching::
-
-            store.scan("user:*")       # all keys starting with "user:"
-            store.scan("*:active")     # all keys ending with ":active"
-            store.scan("cache:[0-9]*") # cache keys starting with a digit
-
-        Args:
-            pattern: GLOB pattern (``*`` matches any chars, ``?`` one char).
-            limit: Maximum number of results.
-            return_type: ``"dict"`` or ``"tuple"``.
-        """
-        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
-            raise TypeError("scan() requires string keys")
-
-        now = self._now()
-        sql = (
-            f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text GLOB ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
-            f"ORDER BY key_text ASC"
+    def _live_row(self, key: Any) -> Mapping[str, Any] | None:
+        """Fetch the row for *key*, lazily deleting it when expired."""
+        encoded = self._encode_key(key)
+        row = Database.fetchone(
+            f"SELECT * FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
+            [encoded.lookup_key, self._namespace],
         )
-        params: list[Any] = [self._namespace, pattern, now]
+        if row is None:
+            return None
+        expires_at = row["expires_at"]
+        if expires_at is not None and expires_at <= self._now():
+            self._delete_by_lookup(encoded.lookup_key)
+            return None
+        return row
 
-        if limit is not None:
-            sql += f" LIMIT {limit}"
-
-        rows = Database.fetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
-        return self._format_pairs(pairs, return_type)
-
-    def prefix_keys(self, prefix: str, *, limit: int | None = None) -> list[str]:
-        """Return only the keys matching *prefix* (no values loaded)."""
-        now = self._now()
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+    def _select_rows(self, *, limit: int | None = None, reverse: bool = False) -> list[Mapping[str, Any]]:
+        if self._enforce and self._resolved_key_format is not None:
+            column = _SORTABLE_COLUMNS[self._resolved_key_format]
+            where = f"WHERE namespace = ? AND key_format = ? AND {_NOT_EXPIRED}"
+            params: list[Any] = [self._namespace, self._resolved_key_format, self._now()]
+        else:
+            column = "lookup_key"
+            where = f"WHERE namespace = ? AND {_NOT_EXPIRED}"
+            params = [self._namespace, self._now()]
+        limit_sql = f" LIMIT {limit}" if limit is not None else ""
         sql = (
-            f"SELECT key_text FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
-            f"ORDER BY key_text ASC"
+            f"SELECT * FROM {self._table} {where} "
+            f"ORDER BY {column} {'DESC' if reverse else 'ASC'}{limit_sql}"
         )
-        params: list[Any] = [self._namespace, prefix, upper, now]
-        if limit is not None:
-            sql += f" LIMIT {limit}"
-        rows = Database.fetchall(sql, params)
-        return [row["key_text"] for row in rows]
+        return Database.fetchall(sql, params)
 
-    def prefix_count(self, prefix: str) -> int:
-        """Return count of keys matching *prefix*."""
-        now = self._now()
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
+    # ------------------------------------------------------------------
+    # MutableMapping core
+    # ------------------------------------------------------------------
+
+    def __getitem__(self, key: Any) -> Any:
+        if isinstance(key, slice):
+            return self.range(key.start, key.stop, step=key.step)
+        row = self._live_row(key)
+        if row is None:
+            raise KeyError(key)
+        return self._decode_value(row["value_format"], row["value_payload"])
+
+    def __setitem__(self, key: Any, value: Any) -> None:
+        self.set(key, value)
+
+    def __delitem__(self, key: Any) -> None:
+        self.delete(key)
+
+    def __contains__(self, key: object) -> bool:
+        if isinstance(key, slice):
+            return False
+        try:
+            return self._live_row(key) is not None
+        except (TypeError, ValueError, pickle.PickleError):
+            return False
+
+    def __len__(self) -> int:
         count = Database.fetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [self._namespace, prefix, upper, now],
+            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE namespace = ? AND {_NOT_EXPIRED}",
+            [self._namespace, self._now()],
             column="cnt",
         )
         return int(count or 0)
 
-    def prefix_delete(self, prefix: str) -> int:
-        """Delete all keys matching *prefix*. Returns number of rows removed."""
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        cursor = Database.execute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ?",
-            [self._namespace, prefix, upper],
+    def __bool__(self) -> bool:
+        row = Database.fetchone(
+            f"SELECT 1 FROM {self._table} WHERE namespace = ? AND {_NOT_EXPIRED} LIMIT 1",
+            [self._namespace, self._now()],
         )
-        return cursor.rowcount
+        return row is not None
+
+    def __iter__(self) -> Iterator[Any]:
+        for row in self._select_rows():
+            yield self._decode_key(row)
+
+    async def __aiter__(self):
+        for key in await self.akeys():
+            yield key
 
     # ------------------------------------------------------------------
-    # Statistics
+    # Dict interface
     # ------------------------------------------------------------------
 
-    def stats(self) -> dict[str, Any]:
-        """Return store statistics for monitoring and debugging.
-
-        Returns a dict with::
-
-            {
-                "total_keys": 150,
-                "expired_keys": 3,
-                "key_format_counts": {"str": 140, "int": 10},
-                "namespace": "myapp",
-                "table": "kv_store",
-                "serializer": "auto",
-            }
-        """
-        now = self._now()
-
-        total = Database.fetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE namespace = ?",
-            [self._namespace],
-            column="cnt",
-        )
-
-        expired = Database.fetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-            [self._namespace, now],
-            column="cnt",
-        )
-
-        format_rows = Database.fetchall(
-            f"SELECT key_format, COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? GROUP BY key_format",
-            [self._namespace],
-        )
-        format_counts = {row["key_format"]: row["cnt"] for row in format_rows}
-
-        return {
-            "total_keys": int(total or 0),
-            "expired_keys": int(expired or 0),
-            "active_keys": int(total or 0) - int(expired or 0),
-            "key_format_counts": format_counts,
-            "namespace": self._namespace,
-            "table": self._table,
-            "serializer": self._serializer_mode,
-            "key_type": self._resolved_key_type.__name__ if self._resolved_key_type else None,
-            "enforce_key_type": self._enforce,
-        }
-
-    async def astats(self) -> dict[str, Any]:
-        """Async version of :meth:`stats`."""
-        now = self._now()
-
-        total = await Database.afetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE namespace = ?",
-            [self._namespace],
-            column="cnt",
-        )
-
-        expired = await Database.afetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
-            [self._namespace, now],
-            column="cnt",
-        )
-
-        format_rows = await Database.afetchall(
-            f"SELECT key_format, COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? GROUP BY key_format",
-            [self._namespace],
-        )
-        format_counts = {row["key_format"]: row["cnt"] for row in format_rows}
-
-        return {
-            "total_keys": int(total or 0),
-            "expired_keys": int(expired or 0),
-            "active_keys": int(total or 0) - int(expired or 0),
-            "key_format_counts": format_counts,
-            "namespace": self._namespace,
-            "table": self._table,
-            "serializer": self._serializer_mode,
-            "key_type": self._resolved_key_type.__name__ if self._resolved_key_type else None,
-            "enforce_key_type": self._enforce,
-        }
-
-    # ------------------------------------------------------------------
-    # Async variants
-    # ------------------------------------------------------------------
-
-    async def aget(self, key: Any, default: Any = None) -> Any:
-        """Async version of :meth:`get`."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        row = await self._afetch_row(encoded.lookup_key)
-        if row is None or self._is_expired(row):
-            if row is not None:
-                cursor = await Database.aexecute(
-                    f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-                    [encoded.lookup_key, self._namespace],
-                )
-                await cursor.close()
+    def get(self, key: Any, default: Any = None) -> Any:
+        """Return the value for *key*, or *default* when missing/expired."""
+        try:
+            return self[key]
+        except KeyError:
             return default
-        return self._decode_value(row["value_format"], row["value_payload"])
 
-    async def aset(
+    def set(
         self,
         key: Any,
         value: Any,
@@ -1417,132 +489,203 @@ class KVStore(MutableMapping[Any, Any]):
         serializer: SerializerMode | None = None,
         ttl: float | int | None = None,
     ) -> None:
-        """Async ``__setitem__`` with optional TTL."""
-        key = self._apply_namespace(key)
-        encoded_key = self._encode_key(key)
-        encoded_value = self._encode_value(value, serializer)
+        """Insert or replace one pair; *ttl* is seconds until expiry."""
+        ek = self._encode_key(key)
+        ev = self._encode_value(value, serializer)
         expires_at = (self._now() + ttl) if ttl is not None else None
-        cursor = await Database.aexecute(_get_upsert_sql(self._table), [
-            encoded_key.lookup_key,
-            self._namespace,
-            encoded_key.key_format,
-            encoded_key.key_payload,
-            encoded_key.key_int,
-            encoded_key.key_real,
-            encoded_key.key_text,
-            encoded_key.key_blob,
-            encoded_value.value_format,
-            encoded_value.value_payload,
-            expires_at,
+        Database.execute(_upsert_sql(self._table), [
+            ek.lookup_key, self._namespace, ek.key_format, ek.key_payload,
+            ek.key_int, ek.key_real, ek.key_text, ek.key_blob,
+            ev.value_format, ev.value_payload, expires_at,
         ])
-        await cursor.close()
 
-    async def adelete(self, key: Any) -> None:
-        """Async ``__delitem__``."""
-        key = self._apply_namespace(key)
-        encoded = self._encode_key(key)
-        cursor = await Database.aexecute(
-            f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-            [encoded.lookup_key, self._namespace],
-        )
-        try:
-            if cursor.rowcount == 0:
-                raise KeyError(self._strip_namespace(key))
-        finally:
-            await cursor.close()
+    def delete(self, key: Any) -> None:
+        """Delete one key.  Raises ``KeyError`` if not present."""
+        if self._delete_by_lookup(self._encode_key(key).lookup_key) == 0:
+            raise KeyError(key)
 
-    async def apop(self, key: Any, *args: Any) -> Any:
-        """Async version of :meth:`pop`."""
-        async with Database.transaction():
+    def pop(self, key: Any, *args: Any) -> Any:
+        """Remove and return the value for *key* (optional default)."""
+        with Database.transaction():
             try:
-                value = await self.aget(key)
-                if value is None and key not in self:
-                    raise KeyError(key)
+                value = self[key]
             except KeyError:
                 if args:
                     return args[0]
                 raise
-            await self.adelete(key)
+            self.delete(key)
             return value
 
-    async def apopitem(self, last: bool = True) -> tuple[Any, Any]:
-        """Async version of :meth:`popitem`."""
-        async with Database.transaction():
-            rows = await self._aselect_rows(limit=1, reverse=last)
+    def popitem(self, last: bool = True) -> tuple[Any, Any]:
+        """Remove and return the last (or first) ``(key, value)`` pair."""
+        with Database.transaction():
+            rows = self._select_rows(limit=1, reverse=last)
             if not rows:
                 raise KeyError("store is empty")
-            row = rows[0]
-            key = self._strip_namespace(self._decode_key(row))
-            value = self._decode_value(row["value_format"], row["value_payload"])
-            await self.adelete(key)
+            key, value = self._decode_pair(rows[0])
+            self.delete(key)
             return key, value
 
-    async def asetdefault(self, key: Any, default: Any = None) -> Any:
-        """Async version of :meth:`setdefault`."""
-        async with Database.transaction():
-            key_ns = self._apply_namespace(key)
-            encoded = self._encode_key(key_ns)
-            row = await self._afetch_row(encoded.lookup_key)
-            if row is not None and not self._is_expired(row):
-                return self._decode_value(row["value_format"], row["value_payload"])
-            await self.aset(key, default)
-            return default
+    def setdefault(self, key: Any, default: Any = None) -> Any:
+        """Return the value for *key*, inserting *default* first if missing."""
+        with Database.transaction():
+            try:
+                return self[key]
+            except KeyError:
+                self.set(key, default)
+                return default
 
-    async def aupdate(self, other: Mapping[Any, Any] | Iterable[tuple[Any, Any]] = (), /, **kwargs: Any) -> None:
-        """Async version of :meth:`update`."""
-        pairs: list[tuple[Any, Any]] = []
-        if isinstance(other, Mapping):
-            pairs.extend(other.items())
-        else:
-            pairs.extend(other)
-        if kwargs:
-            pairs.extend(kwargs.items())
+    def update(self, other: Mapping[Any, Any] | Iterable[tuple[Any, Any]] = (), /, **kwargs: Any) -> None:
+        """Bulk upsert from a mapping, iterable of pairs, and/or kwargs."""
+        pairs = list(other.items() if isinstance(other, Mapping) else other)
+        pairs.extend(kwargs.items())
         if pairs:
-            await self.aset_many(pairs)
+            self.set_many(pairs)
 
-    async def aclear(self) -> None:
-        """Async version of :meth:`clear`."""
-        cursor = await Database.aexecute(
-            f"DELETE FROM {self._table} WHERE namespace = ?", [self._namespace]
+    def clear(self) -> None:
+        """Remove **all** pairs in this store's namespace."""
+        Database.execute(f"DELETE FROM {self._table} WHERE namespace = ?", [self._namespace])
+
+    def keys(self) -> list[Any]:
+        """All keys in sort order."""
+        return [self._decode_key(row) for row in self._select_rows()]
+
+    def values(self) -> list[Any]:
+        """All values, ordered by key."""
+        return [self._decode_value(row["value_format"], row["value_payload"]) for row in self._select_rows()]
+
+    def items(self) -> list[tuple[Any, Any]]:
+        """All ``(key, value)`` pairs, ordered by key."""
+        return [self._decode_pair(row) for row in self._select_rows()]
+
+    # ------------------------------------------------------------------
+    # TTL
+    # ------------------------------------------------------------------
+
+    def ttl(self, key: Any) -> float | None:
+        """Seconds until expiration, or ``None`` for persistent keys."""
+        row = self._live_row(key)
+        if row is None:
+            raise KeyError(key)
+        expires_at = row["expires_at"]
+        return None if expires_at is None else expires_at - self._now()
+
+    def expire(self, key: Any, ttl: float | int) -> bool:
+        """Set a new TTL on an existing key.  Returns ``True`` if applied."""
+        encoded = self._encode_key(key)
+        now = self._now()
+        cursor = Database.execute(
+            f"UPDATE {self._table} SET expires_at = ? "
+            f"WHERE lookup_key = ? AND namespace = ? AND {_NOT_EXPIRED}",
+            [now + ttl, encoded.lookup_key, self._namespace, now],
         )
-        await cursor.close()
+        return cursor.rowcount > 0
 
-    async def akeys(self) -> list[Any]:
-        """Async version of :meth:`keys`."""
-        rows = await self._aselect_rows()
-        return [self._strip_namespace(self._decode_key(row)) for row in rows]
+    def persist(self, key: Any) -> bool:
+        """Remove the TTL from an existing key.  Returns ``True`` if applied."""
+        encoded = self._encode_key(key)
+        cursor = Database.execute(
+            f"UPDATE {self._table} SET expires_at = NULL "
+            f"WHERE lookup_key = ? AND namespace = ? AND {_NOT_EXPIRED}",
+            [encoded.lookup_key, self._namespace, self._now()],
+        )
+        return cursor.rowcount > 0
 
-    async def avalues(self) -> list[Any]:
-        """Async version of :meth:`values`."""
-        rows = await self._aselect_rows()
-        return [
-            self._decode_value(row["value_format"], row["value_payload"])
-            for row in rows
-        ]
+    def purge_expired(self) -> int:
+        """Delete all expired entries.  Returns the number removed."""
+        cursor = Database.execute(
+            f"DELETE FROM {self._table} "
+            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            [self._namespace, self._now()],
+        )
+        return cursor.rowcount
 
-    async def aitems(self) -> list[tuple[Any, Any]]:
-        """Async version of :meth:`items`."""
-        rows = await self._aselect_rows()
-        return [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
+    # ------------------------------------------------------------------
+    # Atomic operations
+    # ------------------------------------------------------------------
 
-    async def aget_many(self, *keys: Any, **kwargs: Any) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Async version of :meth:`get_many`."""
-        return_type = kwargs.get("return_type", "dict")
-        default = kwargs.get("default", _MISSING)
-        skip_missing = kwargs.get("skip_missing", False)
+    def increment(self, key: Any, delta: int | float = 1) -> int | float:
+        """Atomically add *delta* (default 1) to a numeric value.
 
+        Missing keys start from zero.  Returns the new value.
+        """
+        with Database.transaction():
+            current = self.get(key, 0)
+            if not isinstance(current, (int, float)) or isinstance(current, bool):
+                raise TypeError(f"Cannot increment non-numeric value: {type(current).__name__}")
+            new_value = current + delta
+            self.set(key, new_value)
+            return new_value
+
+    def compare_and_swap(self, key: Any, expected: Any, new_value: Any, *, ttl: float | int | None = None) -> bool:
+        """Set *key* to *new_value* only if its current value equals *expected*."""
+        with Database.transaction():
+            try:
+                current = self[key]
+            except KeyError:
+                return False
+            if current != expected:
+                return False
+            self.set(key, new_value, ttl=ttl)
+            return True
+
+    # ------------------------------------------------------------------
+    # Batch operations
+    # ------------------------------------------------------------------
+
+    def set_many(
+        self,
+        items: Mapping[Any, Any] | Iterable[tuple[Any, Any]],
+        *,
+        serializer: SerializerMode | None = None,
+        ttl: float | int | None = None,
+    ) -> None:
+        """Insert or replace many pairs in one statement."""
+        pairs = list(items.items() if isinstance(items, Mapping) else items)
+        if not pairs:
+            return
+        expires_at = (self._now() + ttl) if ttl is not None else None
+        params_seq = []
+        for key, value in pairs:
+            ek = self._encode_key(key)
+            ev = self._encode_value(value, serializer)
+            params_seq.append([
+                ek.lookup_key, self._namespace, ek.key_format, ek.key_payload,
+                ek.key_int, ek.key_real, ek.key_text, ek.key_blob,
+                ev.value_format, ev.value_payload, expires_at,
+            ])
+        Database.executemany(_upsert_sql(self._table), params_seq)
+
+    def delete_many(self, keys: Iterable[Any]) -> int:
+        """Delete multiple keys.  Returns the number of rows removed."""
+        encoded = [self._encode_key(k).lookup_key for k in keys]
+        if not encoded:
+            return 0
+        placeholders = ", ".join("?" for _ in encoded)
+        cursor = Database.execute(
+            f"DELETE FROM {self._table} WHERE namespace = ? AND lookup_key IN ({placeholders})",
+            [self._namespace, *encoded],
+        )
+        return cursor.rowcount
+
+    def get_many(
+        self,
+        *keys: Any,
+        return_type: MultiGetReturn = "dict",
+        default: Any = _MISSING,
+        skip_missing: bool = False,
+    ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Fetch many keys in one query.
+
+        Missing keys raise ``KeyError`` unless *default* is given or
+        *skip_missing* is true.
+        """
         if not keys:
             return {} if return_type == "dict" else ()
-
-        encoded_pairs = [(k, self._encode_key(self._apply_namespace(k))) for k in keys]
+        encoded_pairs = [(k, self._encode_key(k)) for k in keys]
         placeholders = ", ".join("?" for _ in encoded_pairs)
-        rows_raw = await Database.afetchall(
-            f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND lookup_key IN ({placeholders})",
+        rows_raw = Database.fetchall(
+            f"SELECT * FROM {self._table} WHERE namespace = ? AND lookup_key IN ({placeholders})",
             [self._namespace, *[enc.lookup_key for _, enc in encoded_pairs]],
         )
         now = self._now()
@@ -1551,7 +694,6 @@ class KVStore(MutableMapping[Any, Any]):
             for row in rows_raw
             if row["expires_at"] is None or row["expires_at"] > now
         }
-
         pairs: list[tuple[Any, Any]] = []
         for original_key, encoded in encoded_pairs:
             row = rows.get(encoded.lookup_key)
@@ -1561,96 +703,15 @@ class KVStore(MutableMapping[Any, Any]):
                 if default is _MISSING:
                     raise KeyError(original_key)
                 pairs.append((original_key, default))
-                continue
-            pairs.append((
-                original_key,
-                self._decode_value(row["value_format"], row["value_payload"]),
-            ))
+            else:
+                pairs.append((original_key, self._decode_value(row["value_format"], row["value_payload"])))
         return self._format_pairs(pairs, return_type)
 
-    async def aset_many(
-        self,
-        items: Mapping[Any, Any] | Iterable[tuple[Any, Any]],
-        *,
-        serializer: SerializerMode | None = None,
-        ttl: float | int | None = None,
-    ) -> None:
-        """Async version of :meth:`set_many`."""
-        if isinstance(items, Mapping):
-            pairs = list(items.items())
-        else:
-            pairs = list(items)
-        if not pairs:
-            return
+    # ------------------------------------------------------------------
+    # Range / slicing
+    # ------------------------------------------------------------------
 
-        expires_at = (self._now() + ttl) if ttl is not None else None
-        sql = _get_upsert_sql(self._table)
-        params_seq: list[list[Any]] = []
-        for key, value in pairs:
-            key = self._apply_namespace(key)
-            ek = self._encode_key(key)
-            ev = self._encode_value(value, serializer)
-            params_seq.append([
-                ek.lookup_key, self._namespace, ek.key_format, ek.key_payload,
-                ek.key_int, ek.key_real, ek.key_text, ek.key_blob,
-                ev.value_format, ev.value_payload, expires_at,
-            ])
-        cursor = await Database.aexecutemany(sql, params_seq)
-        await cursor.close()
-
-    async def adelete_many(self, keys: Sequence[Any] | Iterable[Any]) -> int:
-        """Async version of :meth:`delete_many`."""
-        keys_list = list(keys)
-        if not keys_list:
-            return 0
-        encoded_keys = [self._encode_key(self._apply_namespace(k)).lookup_key for k in keys_list]
-        placeholders = ", ".join("?" for _ in encoded_keys)
-        cursor = await Database.aexecute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND lookup_key IN ({placeholders})",
-            [self._namespace, *encoded_keys],
-        )
-        try:
-            return cursor.rowcount
-        finally:
-            await cursor.close()
-
-    async def alen(self) -> int:
-        """Async version of :meth:`__len__`."""
-        count = await Database.afetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND (expires_at IS NULL OR expires_at > ?)",
-            [self._namespace, self._now()],
-            column="cnt",
-        )
-        return int(count or 0)
-
-    async def acontains(self, key: Any) -> bool:
-        """Async version of :meth:`__contains__`."""
-        if isinstance(key, slice):
-            return False
-        try:
-            key = self._apply_namespace(key)
-            encoded = self._encode_key(key)
-        except (TypeError, ValueError, pickle.PickleError):
-            return False
-        row = await Database.afetchone(
-            f"SELECT expires_at FROM {self._table} "
-            f"WHERE lookup_key = ? AND namespace = ? LIMIT 1",
-            [encoded.lookup_key, self._namespace],
-        )
-        if row is None:
-            return False
-        if self._is_expired(row):
-            cursor = await Database.aexecute(
-                f"DELETE FROM {self._table} WHERE lookup_key = ? AND namespace = ?",
-                [encoded.lookup_key, self._namespace],
-            )
-            await cursor.close()
-            return False
-        return True
-
-    async def arange(
+    def range(
         self,
         start: Any = None,
         stop: Any = None,
@@ -1659,84 +720,66 @@ class KVStore(MutableMapping[Any, Any]):
         reverse: bool = False,
         return_type: MultiGetReturn = "dict",
     ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Async version of :meth:`range`."""
+        """Return items whose keys lie in ``[start, stop)``.
+
+        Requires ``enforce_key_type=True`` with a sortable key type.
+        """
         if step is not None:
             if step == 0:
                 raise ValueError("step cannot be zero")
             if step < 0:
                 raise ValueError("negative steps are not supported; use reverse=True")
-
         if not self._enforce:
             raise TypeError("range / slice queries require enforce_key_type=True")
-
         if self._resolved_key_type is None:
-            count = await self.alen()
-            if count == 0:
-                return {} if return_type == "dict" else ()
             self._load_existing_key_type()
+            if self._resolved_key_type is None:
+                return {} if return_type == "dict" else ()
 
-        if self._resolved_key_type is None or self._resolved_key_format is None:
-            raise TypeError("range / slice queries require a resolved sortable key type")
+        column = _SORTABLE_COLUMNS[self._resolved_key_format]
+        where = [f"namespace = ?", "key_format = ?", _NOT_EXPIRED]
+        params: list[Any] = [self._namespace, self._resolved_key_format, self._now()]
+        for bound, op in ((start, ">="), (stop, "<")):
+            if bound is not None:
+                if type(bound) is not self._resolved_key_type:
+                    raise TypeError(f"range boundaries must be {self._resolved_key_type.__name__} values")
+                where.append(f"{column} {op} ?")
+                params.append(bound)
 
-        column = self._sortable_column_for_format(self._resolved_key_format)
-        params: list[Any] = [self._namespace, self._resolved_key_format]
-        where_clauses = [
-            "namespace = ?",
-            "key_format = ?",
-            "(expires_at IS NULL OR expires_at > ?)",
-        ]
-        params.append(self._now())
-
-        if start is not None:
-            self._ensure_range_key_type(start)
-            where_clauses.append(f"{column} >= ?")
-            params.append(start)
-        if stop is not None:
-            self._ensure_range_key_type(stop)
-            where_clauses.append(f"{column} < ?")
-            params.append(stop)
-
-        order = "DESC" if reverse else "ASC"
-        sql = (
-            f"SELECT * FROM {self._table} "
-            f"WHERE {' AND '.join(where_clauses)} "
-            f"ORDER BY {column} {order}"
+        rows = Database.fetchall(
+            f"SELECT * FROM {self._table} WHERE {' AND '.join(where)} "
+            f"ORDER BY {column} {'DESC' if reverse else 'ASC'}",
+            params,
         )
-        rows = await Database.afetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
+        pairs = [self._decode_pair(row) for row in rows]
         if step not in (None, 1):
             pairs = pairs[::step]
         return self._format_pairs(pairs, return_type)
 
-    async def akeys_slice(
-        self,
-        start: Any = None,
-        stop: Any = None,
-        *,
-        step: int | None = None,
-        reverse: bool = False,
-    ) -> tuple[Any, ...]:
-        """Async version of :meth:`keys_slice`."""
-        pairs = await self.arange(start, stop, step=step, reverse=reverse, return_type="tuple")
-        return tuple(k for k, _ in pairs)
+    def keys_slice(self, start: Any = None, stop: Any = None, *, step: int | None = None, reverse: bool = False) -> tuple:
+        """Keys-only variant of :meth:`range`."""
+        return tuple(k for k, _ in self.range(start, stop, step=step, reverse=reverse, return_type="tuple"))
 
-    async def avalues_slice(
-        self,
-        start: Any = None,
-        stop: Any = None,
-        *,
-        step: int | None = None,
-        reverse: bool = False,
-    ) -> tuple[Any, ...]:
-        """Async version of :meth:`values_slice`."""
-        pairs = await self.arange(start, stop, step=step, reverse=reverse, return_type="tuple")
-        return tuple(v for _, v in pairs)
+    def values_slice(self, start: Any = None, stop: Any = None, *, step: int | None = None, reverse: bool = False) -> tuple:
+        """Values-only variant of :meth:`range`."""
+        return tuple(v for _, v in self.range(start, stop, step=step, reverse=reverse, return_type="tuple"))
 
-    async def aprefix(
+    # ------------------------------------------------------------------
+    # Prefix / pattern queries (string keys)
+    # ------------------------------------------------------------------
+
+    def _prefix_where(self, prefix: str) -> tuple[str, list[Any]]:
+        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
+            raise TypeError("prefix queries require string keys")
+        where = f"namespace = ? AND key_format = 'str' AND key_text >= ? AND {_NOT_EXPIRED}"
+        params: list[Any] = [self._namespace, prefix, self._now()]
+        upper = _prefix_upper(prefix)
+        if upper is not None:
+            where += " AND key_text < ?"
+            params.append(upper)
+        return where, params
+
+    def prefix(
         self,
         prefix: str,
         *,
@@ -1744,107 +787,278 @@ class KVStore(MutableMapping[Any, Any]):
         reverse: bool = False,
         return_type: MultiGetReturn = "dict",
     ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Async version of :meth:`prefix`."""
-        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
-            raise TypeError("prefix() requires string keys")
+        """Return all entries whose string key starts with *prefix*::
 
-        now = self._now()
-        order = "DESC" if reverse else "ASC"
+            store.prefix("user:")  # {"user:1": ..., "user:2": ...}
+        """
+        where, params = self._prefix_where(prefix)
         sql = (
-            f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
-            f"ORDER BY key_text {order}"
+            f"SELECT * FROM {self._table} WHERE {where} "
+            f"ORDER BY key_text {'DESC' if reverse else 'ASC'}"
         )
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        params: list[Any] = [self._namespace, prefix, upper, now]
-
         if limit is not None:
-            sql += f" LIMIT {limit}"
-
-        rows = await Database.afetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
+            sql += f" LIMIT {int(limit)}"
+        pairs = [self._decode_pair(row) for row in Database.fetchall(sql, params)]
         return self._format_pairs(pairs, return_type)
 
-    async def ascan(
+    def prefix_keys(self, prefix: str, *, limit: int | None = None) -> list[str]:
+        """Only the keys matching *prefix* (values not loaded)."""
+        where, params = self._prefix_where(prefix)
+        sql = f"SELECT key_text FROM {self._table} WHERE {where} ORDER BY key_text ASC"
+        if limit is not None:
+            sql += f" LIMIT {int(limit)}"
+        return [row["key_text"] for row in Database.fetchall(sql, params)]
+
+    def prefix_count(self, prefix: str) -> int:
+        """Count of keys matching *prefix*."""
+        where, params = self._prefix_where(prefix)
+        count = Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE {where}", params, column="cnt"
+        )
+        return int(count or 0)
+
+    def prefix_delete(self, prefix: str) -> int:
+        """Delete all keys matching *prefix*.  Returns the number removed."""
+        if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
+            raise TypeError("prefix queries require string keys")
+        where = "namespace = ? AND key_format = 'str' AND key_text >= ?"
+        params: list[Any] = [self._namespace, prefix]
+        upper = _prefix_upper(prefix)
+        if upper is not None:
+            where += " AND key_text < ?"
+            params.append(upper)
+        return Database.execute(f"DELETE FROM {self._table} WHERE {where}", params).rowcount
+
+    def scan(
         self,
         pattern: str = "*",
         *,
         limit: int | None = None,
         return_type: MultiGetReturn = "dict",
     ) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
-        """Async version of :meth:`scan`."""
+        """Return entries whose string key matches a SQL GLOB *pattern*::
+
+            store.scan("user:*")
+            store.scan("cache:[0-9]*")
+        """
         if self._enforce and self._resolved_key_type is not None and self._resolved_key_type is not str:
             raise TypeError("scan() requires string keys")
-
-        now = self._now()
         sql = (
             f"SELECT * FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text GLOB ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
+            f"WHERE namespace = ? AND key_format = 'str' AND key_text GLOB ? AND {_NOT_EXPIRED} "
             f"ORDER BY key_text ASC"
         )
-        params: list[Any] = [self._namespace, pattern, now]
-
+        params: list[Any] = [self._namespace, pattern, self._now()]
         if limit is not None:
-            sql += f" LIMIT {limit}"
-
-        rows = await Database.afetchall(sql, params)
-        pairs = [
-            (self._strip_namespace(self._decode_key(row)),
-             self._decode_value(row["value_format"], row["value_payload"]))
-            for row in rows
-        ]
+            sql += f" LIMIT {int(limit)}"
+        pairs = [self._decode_pair(row) for row in Database.fetchall(sql, params)]
         return self._format_pairs(pairs, return_type)
 
-    async def aprefix_keys(self, prefix: str, *, limit: int | None = None) -> list[str]:
-        """Async version of :meth:`prefix_keys`."""
+    # ------------------------------------------------------------------
+    # Memoization
+    # ------------------------------------------------------------------
+
+    def memoize(self, ttl: float | int | None = None, *, key_prefix: str | None = None) -> Callable:
+        """Decorator caching a function's results in this store (str keys).
+
+        Works on both sync functions and coroutine functions::
+
+            cache = KVStore("cache", key_type=str)
+
+            @cache.memoize(ttl=300)
+            def expensive(a, b): ...
+
+            @cache.memoize(ttl=300)
+            async def aexpensive(a, b): ...
+        """
+        def decorator(fn: Callable) -> Callable:
+            prefix = key_prefix or f"memo:{fn.__module__}.{fn.__qualname__}"
+
+            def cache_key(args: tuple, kwargs: dict) -> str:
+                return f"{prefix}:{args!r}:{sorted(kwargs.items())!r}"
+
+            if inspect.iscoroutinefunction(fn):
+                @functools.wraps(fn)
+                async def async_wrapper(*args: Any, **kwargs: Any) -> Any:
+                    key = cache_key(args, kwargs)
+                    cached = await self.aget(key, _MISSING)
+                    if cached is not _MISSING:
+                        return cached
+                    result = await fn(*args, **kwargs)
+                    await self.aset(key, result, ttl=ttl)
+                    return result
+                return async_wrapper
+
+            @functools.wraps(fn)
+            def wrapper(*args: Any, **kwargs: Any) -> Any:
+                key = cache_key(args, kwargs)
+                cached = self.get(key, _MISSING)
+                if cached is not _MISSING:
+                    return cached
+                result = fn(*args, **kwargs)
+                self.set(key, result, ttl=ttl)
+                return result
+            return wrapper
+
+        return decorator
+
+    # ------------------------------------------------------------------
+    # Statistics
+    # ------------------------------------------------------------------
+
+    def stats(self) -> dict[str, Any]:
+        """Store statistics for monitoring and debugging."""
         now = self._now()
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        sql = (
-            f"SELECT key_text FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?) "
-            f"ORDER BY key_text ASC"
+        total = int(Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} WHERE namespace = ?",
+            [self._namespace], column="cnt",
+        ) or 0)
+        expired = int(Database.fetch_value(
+            f"SELECT COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE namespace = ? AND expires_at IS NOT NULL AND expires_at <= ?",
+            [self._namespace, now], column="cnt",
+        ) or 0)
+        format_rows = Database.fetchall(
+            f"SELECT key_format, COUNT(*) AS cnt FROM {self._table} "
+            f"WHERE namespace = ? GROUP BY key_format",
+            [self._namespace],
         )
-        params: list[Any] = [self._namespace, prefix, upper, now]
-        if limit is not None:
-            sql += f" LIMIT {limit}"
-        rows = await Database.afetchall(sql, params)
-        return [row["key_text"] for row in rows]
+        return {
+            "total_keys": total,
+            "expired_keys": expired,
+            "active_keys": total - expired,
+            "key_format_counts": {row["key_format"]: row["cnt"] for row in format_rows},
+            "namespace": self._namespace,
+            "table": self._table,
+            "serializer": self._serializer_mode,
+            "key_type": self._resolved_key_type.__name__ if self._resolved_key_type else None,
+            "enforce_key_type": self._enforce,
+        }
+
+    # ------------------------------------------------------------------
+    # Async API - thread delegates of the sync methods above
+    # ------------------------------------------------------------------
+
+    async def aget(self, key: Any, default: Any = None) -> Any:
+        """Async version of :meth:`get`."""
+        return await athread(self.get, key, default)
+
+    async def aset(self, key: Any, value: Any, **kwargs: Any) -> None:
+        """Async version of :meth:`set`."""
+        await awrite(functools.partial(self.set, key, value, **kwargs))
+
+    async def adelete(self, key: Any) -> None:
+        """Async version of :meth:`delete`."""
+        await awrite(self.delete, key)
+
+    async def apop(self, key: Any, *args: Any) -> Any:
+        """Async version of :meth:`pop`."""
+        return await awrite(self.pop, key, *args)
+
+    async def apopitem(self, last: bool = True) -> tuple[Any, Any]:
+        """Async version of :meth:`popitem`."""
+        return await awrite(self.popitem, last)
+
+    async def asetdefault(self, key: Any, default: Any = None) -> Any:
+        """Async version of :meth:`setdefault`."""
+        return await awrite(self.setdefault, key, default)
+
+    async def aupdate(self, other: Mapping[Any, Any] | Iterable[tuple[Any, Any]] = (), /, **kwargs: Any) -> None:
+        """Async version of :meth:`update`."""
+        await awrite(functools.partial(self.update, other, **kwargs))
+
+    async def aclear(self) -> None:
+        """Async version of :meth:`clear`."""
+        await awrite(self.clear)
+
+    async def akeys(self) -> list[Any]:
+        """Async version of :meth:`keys`."""
+        return await athread(self.keys)
+
+    async def avalues(self) -> list[Any]:
+        """Async version of :meth:`values`."""
+        return await athread(self.values)
+
+    async def aitems(self) -> list[tuple[Any, Any]]:
+        """Async version of :meth:`items`."""
+        return await athread(self.items)
+
+    async def alen(self) -> int:
+        """Async version of :meth:`__len__`."""
+        return await athread(self.__len__)
+
+    async def acontains(self, key: Any) -> bool:
+        """Async version of ``key in store``."""
+        return await athread(self.__contains__, key)
+
+    async def attl(self, key: Any) -> float | None:
+        """Async version of :meth:`ttl`."""
+        return await athread(self.ttl, key)
+
+    async def aexpire(self, key: Any, ttl: float | int) -> bool:
+        """Async version of :meth:`expire`."""
+        return await awrite(self.expire, key, ttl)
+
+    async def apersist(self, key: Any) -> bool:
+        """Async version of :meth:`persist`."""
+        return await awrite(self.persist, key)
+
+    async def apurge_expired(self) -> int:
+        """Async version of :meth:`purge_expired`."""
+        return await awrite(self.purge_expired)
+
+    async def aincrement(self, key: Any, delta: int | float = 1) -> int | float:
+        """Async version of :meth:`increment`."""
+        return await awrite(self.increment, key, delta)
+
+    async def acompare_and_swap(self, key: Any, expected: Any, new_value: Any, **kwargs: Any) -> bool:
+        """Async version of :meth:`compare_and_swap`."""
+        return await awrite(functools.partial(self.compare_and_swap, key, expected, new_value, **kwargs))
+
+    async def aset_many(self, items: Mapping[Any, Any] | Iterable[tuple[Any, Any]], **kwargs: Any) -> None:
+        """Async version of :meth:`set_many`."""
+        await awrite(functools.partial(self.set_many, items, **kwargs))
+
+    async def adelete_many(self, keys: Iterable[Any]) -> int:
+        """Async version of :meth:`delete_many`."""
+        return await awrite(self.delete_many, keys)
+
+    async def aget_many(self, *keys: Any, **kwargs: Any) -> dict[Any, Any] | tuple[tuple[Any, Any], ...]:
+        """Async version of :meth:`get_many`."""
+        return await athread(functools.partial(self.get_many, *keys, **kwargs))
+
+    async def arange(self, start: Any = None, stop: Any = None, **kwargs: Any) -> Any:
+        """Async version of :meth:`range`."""
+        return await athread(functools.partial(self.range, start, stop, **kwargs))
+
+    async def akeys_slice(self, start: Any = None, stop: Any = None, **kwargs: Any) -> tuple:
+        """Async version of :meth:`keys_slice`."""
+        return await athread(functools.partial(self.keys_slice, start, stop, **kwargs))
+
+    async def avalues_slice(self, start: Any = None, stop: Any = None, **kwargs: Any) -> tuple:
+        """Async version of :meth:`values_slice`."""
+        return await athread(functools.partial(self.values_slice, start, stop, **kwargs))
+
+    async def aprefix(self, prefix: str, **kwargs: Any) -> Any:
+        """Async version of :meth:`prefix`."""
+        return await athread(functools.partial(self.prefix, prefix, **kwargs))
+
+    async def aprefix_keys(self, prefix: str, **kwargs: Any) -> list[str]:
+        """Async version of :meth:`prefix_keys`."""
+        return await athread(functools.partial(self.prefix_keys, prefix, **kwargs))
 
     async def aprefix_count(self, prefix: str) -> int:
         """Async version of :meth:`prefix_count`."""
-        now = self._now()
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        count = await Database.afetch_value(
-            f"SELECT COUNT(*) AS cnt FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ? "
-            f"AND (expires_at IS NULL OR expires_at > ?)",
-            [self._namespace, prefix, upper, now],
-            column="cnt",
-        )
-        return int(count or 0)
+        return await athread(self.prefix_count, prefix)
 
     async def aprefix_delete(self, prefix: str) -> int:
         """Async version of :meth:`prefix_delete`."""
-        upper = prefix[:-1] + chr(ord(prefix[-1]) + 1) if prefix else ""
-        cursor = await Database.aexecute(
-            f"DELETE FROM {self._table} "
-            f"WHERE namespace = ? AND key_format = 'str' "
-            f"AND key_text >= ? AND key_text < ?",
-            [self._namespace, prefix, upper],
-        )
-        try:
-            return cursor.rowcount
-        finally:
-            await cursor.close()
+        return await awrite(self.prefix_delete, prefix)
 
+    async def ascan(self, pattern: str = "*", **kwargs: Any) -> Any:
+        """Async version of :meth:`scan`."""
+        return await athread(functools.partial(self.scan, pattern, **kwargs))
+
+    async def astats(self) -> dict[str, Any]:
+        """Async version of :meth:`stats`."""
+        return await athread(self.stats)

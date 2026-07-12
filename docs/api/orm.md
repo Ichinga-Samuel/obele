@@ -8,11 +8,23 @@ Core database, model, mixin, and pagination APIs.
 
 ::: obele.Database
 
-::: obele.AsyncSQLiteConnection
+::: obele.DatabaseScope
 
-::: obele.AsyncSQLiteCursor
+::: obele.Transaction
 
-::: obele.async_connect
+::: obele.ExecResult
+
+## Schema Helpers
+
+::: obele.create_all
+
+::: obele.acreate_all
+
+::: obele.drop_all
+
+::: obele.adrop_all
+
+::: obele.registered_models
 
 ## Mixins
 

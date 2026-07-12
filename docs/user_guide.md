@@ -22,12 +22,13 @@ You can pass SQLite pragmas and connection options:
 Database.configure(
     "app.sqlite3",
     pragmas={"cache_size": -16000},
-    pool_size=10,
-    max_connection_age=300,
     log_queries=True,
     slow_query_threshold=0.5,
 )
 ```
+
+Each thread gets its own connection (WAL mode gives concurrent reads), and a
+plain `":memory:"` path is automatically shared across every thread and task.
 
 Async configuration and cleanup are available too:
 
@@ -49,6 +50,21 @@ class Product(Model):
     name = TextField()
     price = IntegerField()
     is_active = BooleanField(default=True)
+```
+
+Every model also exposes a read/write `pk` property, regardless of the name
+chosen for its primary-key field.
+
+Fields accept `choices=` for value validation. Numeric fields additionally
+support `min_value=` and `max_value=`:
+
+```python
+class Product(Model):
+    table_name = "products"
+
+    name = TextField()
+    price = IntegerField(min_value=0)
+    status = TextField(choices=["draft", "published"])
 ```
 
 Create the table before inserting data:
@@ -93,13 +109,36 @@ Product.exclude(name="Archived")
 Product.order_by("-price", "name").limit(10).offset(20)
 ```
 
+QuerySets support lazy slicing and indexing:
+
+```python
+top_ten = Product.order_by("-price")[:10].all()
+third = Product.order_by("price")[2]
+```
+
 Materialize results with terminal methods:
 
 ```python
 products = Product.filter(is_active=True).all()
 first = Product.order_by("name").first()
+last = Product.order_by("name").last()
 count = Product.filter(price__gt=1000).count()
 exists = Product.filter(name="Laptop").exists()
+newest = Product.latest()                    # newest row by PK (or a field)
+by_id = Product.in_bulk([1, 2, 3])           # {pk: instance}
+```
+
+## Expressions
+
+`F()` references a column, and expressions compose with arithmetic - useful
+for atomic updates and computed comparisons:
+
+```python
+from obele import F, Count
+
+Product.filter(id=pk).update(views=F("views") + 1)
+Product.filter(price__lt=F("cost") * 2).all()
+Product.annotate(n=Count()).group_by("id").all()
 ```
 
 Async query methods use the same API:
@@ -155,13 +194,34 @@ item = Item.select_related("category").first()
 print(item.category.name)
 ```
 
+Use `prefetch_related()` to batch-load reverse relations; prefetched managers
+serve cached rows without extra queries:
+
+```python
+categories = Category.prefetch_related("items").all()
+for category in categories:
+    category.items.all()   # no query - served from the prefetch cache
+```
+
+## Creating Schemas
+
+`create_all()` creates the tables for every registered model in foreign-key
+dependency order (`drop_all()` reverses it):
+
+```python
+import obele
+
+obele.create_all()
+await obele.acreate_all()
+```
+
 ## Transactions
 
 Transactions support both sync and async context managers. Nested transactions
 use SQLite savepoints.
 
 ```python
-with Database.transaction():
+with Database.transaction(mode="IMMEDIATE"):
     Product.create(name="One", price=1)
     Product.create(name="Two", price=2)
 
@@ -169,6 +229,10 @@ async with Database.transaction():
     await Product.acreate(name="Async One", price=1)
     await Product.acreate(name="Async Two", price=2)
 ```
+
+The transaction mode may be `"DEFERRED"`, `"IMMEDIATE"` (the default), or
+`"EXCLUSIVE"`. `execute_script()` is intentionally rejected inside a
+transaction because SQLite scripts can commit implicitly.
 
 ## Scoped Databases
 
@@ -198,27 +262,28 @@ row = Database.fetchone("SELECT * FROM products WHERE id = ?", [cursor.lastrowid
 rows = Database.fetchall("SELECT * FROM products")
 ```
 
-Async direct SQL uses the bundled async SQLite bridge and returns async cursors:
+Async direct SQL returns a fully materialized `ExecResult` - there is no
+cursor to close:
 
 ```python
-cursor = await Database.aexecute(
+result = await Database.aexecute(
     "INSERT INTO products (name, price) VALUES (?, ?)",
     ["Laptop", 1200],
 )
-await cursor.close()
+print(result.lastrowid, result.rowcount)
 
 row = await Database.afetchone("SELECT * FROM products WHERE id = ?", [1])
 rows = await Database.afetchall("SELECT * FROM products")
 ```
 
-For raw async SQLite access, use `async_connect`:
+Statements with a `RETURNING` clause expose their rows on the result:
 
 ```python
-from obele import async_connect
-
-async with async_connect("raw.sqlite3") as connection:
-    cursor = await connection.execute("SELECT 1")
-    await cursor.close()
+result = await Database.aexecute(
+    "INSERT INTO products (name, price) VALUES (?, ?) RETURNING id",
+    ["Mouse", 25],
+)
+print(result.first["id"])
 ```
 
 ## Pagination
@@ -314,6 +379,21 @@ enabled = await store.aget("feature:search")
 
 await store.aset_many({"a": 1, "b": 2})
 items = await store.aitems()
+
+store.increment("page:hits")               # atomic counter (starts at 0)
+store.compare_and_swap("state", "old", "new")
+```
+
+`memoize()` caches function results (sync or async) in the store:
+
+```python
+cache = KVStore("cache", key_type=str)
+
+@cache.memoize(ttl=300)
+def expensive_report(day: str) -> dict: ...
+
+@cache.memoize(ttl=300)
+async def fetch_profile(user_id: int) -> dict: ...
 ```
 
 ## Testing

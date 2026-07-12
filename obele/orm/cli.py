@@ -9,8 +9,7 @@ from typing import Any, Sequence
 
 from .._identity import CLI_PROGRAM, PACKAGE_NAME
 from .database import Database
-from .fields import ForeignKeyField
-from .model import Model
+from .model import Model, _toposort_models
 
 
 def _coerce_scalar(value: str) -> Any:
@@ -116,47 +115,6 @@ def _discover_models(module_names: Sequence[str], model_specs: Sequence[str]) ->
     if not models:
         raise ValueError("No models were discovered. Pass --module and/or --model.")
     return models
-
-
-def _toposort_models(models: Sequence[type[Model]]) -> list[type[Model]]:
-    ordered = list(models)
-    index = {model_cls: position for position, model_cls in enumerate(ordered)}
-    selected = set(ordered)
-    dependencies: dict[type[Model], set[type[Model]]] = {}
-
-    for model_cls in ordered:
-        deps: set[type[Model]] = set()
-        for field in model_cls._fields.values():
-            if not isinstance(field, ForeignKeyField):
-                continue
-            related_model = field.related_model
-            if related_model is model_cls or related_model not in selected:
-                continue
-            deps.add(related_model)
-        dependencies[model_cls] = deps
-
-    result: list[type[Model]] = []
-    ready = sorted(
-        [model_cls for model_cls, deps in dependencies.items() if not deps],
-        key=index.__getitem__,
-    )
-
-    while ready:
-        model_cls = ready.pop(0)
-        if model_cls in result:
-            continue
-        result.append(model_cls)
-        for candidate, deps in dependencies.items():
-            if model_cls in deps:
-                deps.remove(model_cls)
-                if not deps and candidate not in result and candidate not in ready:
-                    ready.append(candidate)
-                    ready.sort(key=index.__getitem__)
-
-    for model_cls in ordered:
-        if model_cls not in result:
-            result.append(model_cls)
-    return result
 
 
 def _resolve_model_reference(
