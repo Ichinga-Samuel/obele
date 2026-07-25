@@ -53,3 +53,25 @@ include = ["obele*"]
 testpaths = ["tests"]
 asyncio_mode = "auto"
 pythonpath = ["."]
+
+[tool.ruff]
+line-length = 140
+src = ["src", "tests"]
+target-version = "py313"
+
+[tool.ruff.format]
+indent-style = "tab"
+skip-magic-trailing-comma = true
+
+[tool.ruff.lint]
+ignore = ["E101", "E501", "E731"]
+select = ["E", "F", "I"]
+
+[tool.ruff.lint.isort]
+split-on-trailing-comma = false
+
+[dependency-groups]
+dev = [
+    "pytest>=9.0.2",
+    "ruff>=0.15.22",
+]

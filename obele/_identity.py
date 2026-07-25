@@ -11,5 +11,5 @@ SAVEPOINT_PREFIX = f"{PACKAGE_NAME}_sp_"
 
 
 def default_database_path() -> str:
-    """Resolve the default database path from the environment."""
-    return os.environ.get(DATABASE_ENV_VAR) or "DB.sqlite3"
+	"""Resolve the default database path from the environment."""
+	return os.environ.get(DATABASE_ENV_VAR) or "DB.sqlite3"

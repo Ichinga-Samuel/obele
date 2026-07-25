@@ -1,13 +1,13 @@
 """Global singleton key-value store.
 
-The :class:`KV` class provides a convenient, process-wide singleton wrapper
-around :class:`~obele.kv.store.KVStore`.  The first instantiation creates
+The `KV` class provides a convenient, process-wide singleton wrapper
+around `KVStore`.  The first instantiation creates
 the underlying store; subsequent instantiations return the **same** instance
-(any constructor arguments are silently ignored).  Call :meth:`KV.reset` to
-discard the current instance so that the next ``KV(...)`` call creates a fresh
+(any constructor arguments are silently ignored).  Call `KV.reset` to
+discard the current instance so that the next `KV(...)` call creates a fresh
 one.
 
-Usage::
+Usage:
 
     from obele.kv import KV
 
@@ -30,81 +30,79 @@ from __future__ import annotations
 import threading
 from typing import Any
 
-from .store import KVStore, _Dumps, _Loads, SerializerMode
+from .store import KVStore, SerializerMode, _Dumps, _Loads
 
 
 class KV(KVStore):
-    """Singleton :class:`KVStore` subclass.
+	"""Singleton `KVStore` subclass.
 
-    The first ``KV(...)`` call creates the global instance using the
-    supplied arguments.  Every subsequent call returns that same instance,
-    ignoring any new arguments, until :meth:`reset` is called.
+	The first `KV(...)` call creates the global instance using the
+	supplied arguments.  Every subsequent call returns that same instance,
+	ignoring any new arguments, until `reset` is called.
 
-    Inherits the full :class:`KVStore` API - dict access, slicing,
-    multi-key queries, range queries, async methods, etc.
-    """
+	Inherits the full `KVStore` API - dict access, slicing,
+	multi-key queries, range queries, async methods, etc.
+	"""
 
-    _instance: KV | None = None
-    _lock: threading.Lock = threading.Lock()
+	_instance: KV | None = None
+	_lock: threading.Lock = threading.Lock()
 
-    def __new__(
-        cls,
-        table_name: str = "kv_default",
-        *,
-        key_type: type[Any] | None = None,
-        enforce_key_type: bool = True,
-        serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
-        namespace: str | None = None,
-    ) -> KV:
-        # Fast path - no lock needed for reads.
-        if cls._instance is not None:
-            return cls._instance
+	def __new__(
+		cls,
+		table_name: str = "kv_default",
+		*,
+		key_type: type[Any] | None = None,
+		enforce_key_type: bool = True,
+		serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
+		namespace: str | None = None,
+	) -> KV:
+		"""Return the process-wide singleton, creating it on the first call."""
+		# Fast path - no lock needed for reads.
+		if cls._instance is not None:
+			return cls._instance
 
-        with cls._lock:
-            # Double-check after acquiring lock.
-            if cls._instance is not None:
-                return cls._instance
+		with cls._lock:
+			# Double-check after acquiring lock.
+			if cls._instance is not None:
+				return cls._instance
 
-            instance = super().__new__(cls)
-            cls._instance = instance
-        return instance
+			instance = super().__new__(cls)
+			cls._instance = instance
+		return instance
 
-    def __init__(
-        self,
-        table_name: str = "kv_default",
-        *,
-        key_type: type[Any] | None = None,
-        enforce_key_type: bool = True,
-        serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
-        namespace: str | None = None,
-    ) -> None:
-        if getattr(self, "_kv_initialized", False):
-            return
-        super().__init__(
-            table_name=table_name,
-            key_type=key_type,
-            enforce_key_type=enforce_key_type,
-            serializer=serializer,
-            namespace=namespace,
-        )
-        self._kv_initialized = True
+	def __init__(
+		self,
+		table_name: str = "kv_default",
+		*,
+		key_type: type[Any] | None = None,
+		enforce_key_type: bool = True,
+		serializer: SerializerMode | tuple[_Dumps, _Loads] = "auto",
+		namespace: str | None = None,
+	) -> None:
+		"""Initialize the backing store once; later calls are no-ops."""
+		if getattr(self, "_kv_initialized", False):
+			return
+		super().__init__(
+			table_name=table_name, key_type=key_type, enforce_key_type=enforce_key_type, serializer=serializer, namespace=namespace
+		)
+		self._kv_initialized = True
 
-    @classmethod
-    def reset(cls) -> None:
-        """Discard the current singleton instance.
+	@classmethod
+	def reset(cls) -> None:
+		"""Discard the current singleton instance.
 
-        The next ``KV(...)`` call will create a brand-new :class:`KVStore`
-        with whatever arguments are provided.
-        """
-        with cls._lock:
-            cls._instance = None
+		The next `KV(...)` call will create a brand-new `KVStore`
+		with whatever arguments are provided.
+		"""
+		with cls._lock:
+			cls._instance = None
 
-    def __repr__(self) -> str:
-        if not getattr(self, "_kv_initialized", False):
-            return "<KV (not initialised)>"
-        return (
-            f"<KV table={self._table!r} namespace={self._namespace!r} size={len(self)} "
-            f"key_type={self._resolved_key_type.__name__ if self._resolved_key_type else 'unset'} "
-            f"enforce={self._enforce}>"
-        )
-
+	def __repr__(self) -> str:
+		"""Return a debug representation, flagging the uninitialized state."""
+		if not getattr(self, "_kv_initialized", False):
+			return "<KV (not initialised)>"
+		return (
+			f"<KV table={self._table!r} namespace={self._namespace!r} size={len(self)} "
+			f"key_type={self._resolved_key_type.__name__ if self._resolved_key_type else 'unset'} "
+			f"enforce={self._enforce}>"
+		)

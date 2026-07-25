@@ -7,7 +7,7 @@ from obele import Database
 
 @pytest.fixture(autouse=True)
 def setup_db():
-    """Configure a fresh in-memory database for every test."""
-    Database.configure("file::memory:?cache=shared")
-    yield
-    Database.close_all()
+	"""Configure a fresh in-memory database for every test."""
+	Database.configure("file::memory:?cache=shared")
+	yield
+	Database.close_all()
